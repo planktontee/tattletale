@@ -1,4 +1,6 @@
 const std = @import("std");
+const regent = @import("regent");
+const assert = std.debug.assert;
 const Range = @import("range.zig");
 const Allocator = std.mem.Allocator;
 
@@ -51,26 +53,28 @@ pub const Token = union(enum) {
     // single chars
     atom: u8,
 
-    quantifier: union(enum) {
-        optional,
-
-        anyGreedy,
-        anyLazy,
-
-        moreGreedy,
-        moreLazy,
-
-        minGreedy: usize,
-        minLazy: usize,
-
-        maxGreedy: usize,
-        maxLazy: usize,
-
-        rangeGreedy: Range,
-        rangeLazy: Range,
-    },
+    quantifier: Quantifier,
 
     done,
+};
+
+pub const Quantifier = union(enum) {
+    optional,
+
+    anyGreedy,
+    anyLazy,
+
+    moreGreedy,
+    moreLazy,
+
+    minGreedy: usize,
+    minLazy: usize,
+
+    maxGreedy: usize,
+    maxLazy: usize,
+
+    rangeGreedy: Range,
+    rangeLazy: Range,
 };
 
 const State = union(enum) {
@@ -121,7 +125,7 @@ pub fn next(self: *@This()) Error!Token {
     stateLoop: while (true) {
         switch (self.state) {
             .init => {
-                if (self.i >= self.pattern.len) {
+                if (self.finished()) {
                     self.state = .done;
                     continue :stateLoop;
                 }
@@ -129,11 +133,11 @@ pub fn next(self: *@This()) Error!Token {
                 return .branchStart;
             },
             .seekPiece => {
-                if (self.i >= self.pattern.len) {
+                if (self.finished()) {
                     self.state = .done;
                     continue :stateLoop;
                 }
-                switch (self.pattern[self.i]) {
+                switch (self.peek()) {
                     // 0x24
                     '$',
                     => {},
@@ -148,41 +152,40 @@ pub fn next(self: *@This()) Error!Token {
                     // 0x2A
                     '*',
                     => {
-                        self.i += 1;
+                        self.consume();
                         self.state = .anyGreedy;
                         continue :stateLoop;
                     },
                     // 0x2B
                     '+',
                     => {
-                        self.i += 1;
+                        self.consume();
                         self.state = .moreGreedy;
                         continue :stateLoop;
                     },
                     // 0x3F
                     '?',
                     => {
-                        self.i += 1;
+                        self.consume();
                         return .{ .quantifier = .optional };
                     },
                     // 0x7B
                     '{',
                     => {
-                        self.i += 1;
                         var range: Range = undefined;
                         try range.parseRange(self);
-                        self.state = .seekPiece;
 
-                        if (self.i >= self.pattern.len) {
-                            self.state = .seekPiece;
+                        if (self.finished()) {
+                            self.state = .done;
                             return .{
                                 .quantifier = .{ .rangeGreedy = range },
                             };
                         }
 
-                        switch (self.pattern[self.i]) {
+                        self.state = .seekPiece;
+                        switch (self.peek()) {
                             '?' => {
-                                self.i += 1;
+                                self.consume();
                                 return .{
                                     .quantifier = .{ .rangeLazy = range },
                                 };
@@ -244,8 +247,8 @@ pub fn next(self: *@This()) Error!Token {
                     '~',
                     0x7F,
                     => {
-                        const token: Token = .{ .atom = self.pattern[self.i] };
-                        self.i += 1;
+                        const token: Token = .{ .atom = self.peek() };
+                        self.consume();
                         return token;
                     },
 
@@ -264,13 +267,13 @@ pub fn next(self: *@This()) Error!Token {
             },
             .anyGreedy,
             => {
-                if (self.i >= self.pattern.len) {
+                if (self.finished()) {
                     self.state = .done;
                     return .{ .quantifier = .anyGreedy };
                 }
-                switch (self.pattern[self.i]) {
+                switch (self.peek()) {
                     '?' => {
-                        self.i += 1;
+                        self.consume();
                         self.state = .seekPiece;
                         return .{ .quantifier = .anyLazy };
                     },
@@ -282,13 +285,13 @@ pub fn next(self: *@This()) Error!Token {
             },
             .moreGreedy,
             => {
-                if (self.i >= self.pattern.len) {
+                if (self.finished()) {
                     self.state = .done;
                     return .{ .quantifier = .moreGreedy };
                 }
-                switch (self.pattern[self.i]) {
+                switch (self.peek()) {
                     '?' => {
-                        self.i += 1;
+                        self.consume();
                         self.state = .seekPiece;
                         return .{ .quantifier = .moreLazy };
                     },
@@ -305,13 +308,41 @@ pub fn next(self: *@This()) Error!Token {
     unreachable;
 }
 
+pub inline fn finished(self: *const Scanner) bool {
+    return self.i >= self.pattern.len;
+}
+
+pub inline fn hasNext(self: *const Scanner) bool {
+    return self.i < self.pattern.len;
+}
+
+pub inline fn consume(self: *Scanner) void {
+    assert(self.hasNext());
+    self.i += 1;
+}
+
+pub inline fn peek(self: *const Scanner) u8 {
+    assert(self.hasNext());
+    return self.pattern[self.i];
+}
+
+pub inline fn sliceFrom(self: *const Scanner, start: usize) []const u8 {
+    assert(start < self.pattern.len);
+    assert(start < self.i);
+    return self.pattern[start..self.i];
+}
+
+pub inline fn ensureByte(self: *const Scanner) ConsumeError!void {
+    if (self.finished()) return Error.UnexpectedEnd;
+}
+
 pub const ConsumeError = error{
     UnexpectedEnd,
 };
 
 pub fn consumeWhite(self: *Scanner) ConsumeError!void {
-    while (self.i < self.pattern.len) : (self.i += 1) {
-        switch (self.pattern[self.i]) {
+    while (self.hasNext()) : (self.consume()) {
+        switch (self.peek()) {
             ' ',
             '\t',
             => continue,
@@ -321,8 +352,8 @@ pub fn consumeWhite(self: *Scanner) ConsumeError!void {
 }
 
 pub fn consumeDigits(self: *Scanner) ConsumeError!void {
-    while (self.i < self.pattern.len) : (self.i += 1) {
-        switch (self.pattern[self.i]) {
+    while (self.hasNext()) : (self.consume()) {
+        switch (self.peek()) {
             '0'...'9',
             => continue,
             else => break,
@@ -341,8 +372,8 @@ pub fn report(self: *Scanner, e: Error, comptime message: []const u8) Error!nore
         "{s} - {s}<{c}>{s} - " ++ message,
         .{
             @errorName(e),
-            self.pattern[0..self.i],
-            self.pattern[self.i],
+            if (self.i == 0) "" else self.pattern[0..self.i],
+            if (self.i == 0 or self.finished()) 0x00 else self.pattern[self.i],
             if (self.i + 1 >= self.pattern.len) "" else self.pattern[self.i + 1 ..],
         },
     );
@@ -392,7 +423,7 @@ test "Parse tokens" {
 test "Parse ranges" {
     const t = std.testing;
 
-    const pattern: []const u8 = "a{,}b{12}?";
+    const pattern: []const u8 = "a{0}b{12}?c{1,2}";
     var scanner: Scanner = undefined;
     var diag: DiagnosticTracker = undefined;
     defer diag.deinit();
@@ -409,6 +440,12 @@ test "Parse ranges" {
         .{
             .quantifier = .{
                 .rangeLazy = .{ .min = 12, .max = 12 },
+            },
+        },
+        .{ .atom = 'c' },
+        .{
+            .quantifier = .{
+                .rangeGreedy = .{ .min = 1, .max = 2 },
             },
         },
         .done,

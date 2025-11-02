@@ -1,6 +1,12 @@
 .{
     .name = .tattletale,
     .version = "0.0.1",
+    .dependencies = .{
+        .regent = .{
+            .url = "git+https://github.com/planktontee/regent/#1659c200774152d4ae9e3a6467731b0b929fc3ae",
+            .hash = "regent-0.0.1-zgdbw3gwAACzgOmWh62YQL-BP5tQkzzar0ZtqW187aw1",
+        },
+    },
     .minimum_zig_version = "0.15.2",
     .paths = .{""},
     .fingerprint = 0x1031a39d82ce7edf,

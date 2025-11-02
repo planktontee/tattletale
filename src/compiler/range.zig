@@ -1,4 +1,5 @@
 const std = @import("std");
+const regent = @import("regent");
 const Scanner = @import("scanner.zig");
 
 min: usize,
@@ -16,8 +17,11 @@ pub const Error = error{
 const State = enum {
     init,
 
+    initStartParse,
     startParse,
+
     seekComma,
+
     initEndParse,
     endParse,
 
@@ -26,16 +30,28 @@ const State = enum {
 
 pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
     var state: State = .init;
-    var startI: usize = undefined;
+    var digitsIdx: usize = undefined;
 
     stateLoop: while (true) {
         switch (state) {
             .init => {
+                try scanner.ensureByte();
+                switch (scanner.peek()) {
+                    '{',
+                    => {
+                        scanner.consume();
+                        state = .initStartParse;
+                        continue :stateLoop;
+                    },
+                    else => return Error.SyntaxError,
+                }
+            },
+            .initStartParse => {
                 try scanner.consumeWhite();
-                switch (scanner.pattern[scanner.i]) {
+                switch (scanner.peek()) {
                     '0',
                     => {
-                        scanner.i += 1;
+                        scanner.consume();
                         self.min = 0;
                         try scanner.consumeWhite();
                         state = .seekComma;
@@ -43,13 +59,12 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
                     },
                     '1'...'9',
                     => {
-                        startI = scanner.i;
-                        scanner.i += 1;
+                        digitsIdx = scanner.i;
+                        scanner.consume();
                         state = .startParse;
                         continue :stateLoop;
                     },
                     ',' => {
-                        scanner.i += 1;
                         self.min = 0;
                         try scanner.consumeWhite();
                         state = .seekComma;
@@ -60,17 +75,17 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
             },
             .startParse => {
                 try scanner.consumeDigits();
-                const endDigits = scanner.i;
+                const digits = scanner.sliceFrom(digitsIdx);
                 try scanner.consumeWhite();
-                self.min = try std.fmt.parseInt(usize, scanner.pattern[startI..endDigits], 10);
+                self.min = try std.fmt.parseInt(usize, digits, 10);
                 state = .seekComma;
                 continue :stateLoop;
             },
             .seekComma => {
-                switch (scanner.pattern[scanner.i]) {
+                switch (scanner.peek()) {
                     ',',
                     => {
-                        scanner.i += 1;
+                        scanner.consume();
                         state = .initEndParse;
                         continue :stateLoop;
                     },
@@ -79,15 +94,15 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
                         self.max = self.min;
                         state = .end;
                     },
-                    else => return Error.InvalidCharacter,
+                    else => return Error.SyntaxError,
                 }
             },
             .initEndParse => {
                 try scanner.consumeWhite();
-                switch (scanner.pattern[scanner.i]) {
+                switch (scanner.peek()) {
                     '0',
                     => {
-                        scanner.i += 1;
+                        scanner.consume();
                         self.max = 0;
                         try scanner.consumeWhite();
                         state = .end;
@@ -95,8 +110,8 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
                     },
                     '1'...'9',
                     => {
-                        startI = scanner.i;
-                        scanner.i += 1;
+                        digitsIdx = scanner.i;
+                        scanner.consume();
                         state = .endParse;
                         continue :stateLoop;
                     },
@@ -106,27 +121,26 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
                         try scanner.consumeWhite();
                         continue :stateLoop;
                     },
-                    ',' => return Error.InvalidCharacter,
                     else => return Error.SyntaxError,
                 }
             },
             .endParse => {
                 try scanner.consumeDigits();
-                const endDigits = scanner.i;
+                const digits = scanner.sliceFrom(digitsIdx);
                 try scanner.consumeWhite();
-                self.max = try std.fmt.parseInt(usize, scanner.pattern[startI..endDigits], 10);
+                self.max = try std.fmt.parseInt(usize, digits, 10);
                 state = .end;
                 continue :stateLoop;
             },
             .end => {
                 if (self.min > self.max) return Error.StartSmallerThanEnd;
-                switch (scanner.pattern[scanner.i]) {
+                switch (scanner.peek()) {
                     '}',
                     => {
-                        scanner.i += 1;
+                        scanner.consume();
                         return;
                     },
-                    else => return Error.InvalidCharacter,
+                    else => return Error.SyntaxError,
                 }
             },
         }
@@ -134,21 +148,86 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
     unreachable;
 }
 
-fn testParse(allocator: std.mem.Allocator, diag: *Scanner.DiagnosticTracker, pattern: []const u8) !Range {
+fn testParse(scanner: *Scanner, pattern: []const u8) !Range {
     var range: Range = undefined;
-    var scanner: Scanner = undefined;
-    scanner.initWithDiag(allocator, diag, pattern);
-    range.parseRange(&scanner) catch |e| try scanner.report(e, "Failed parsing range");
+
+    scanner.pattern = pattern;
+    scanner.state = .init;
+    scanner.i = 0;
+
+    range.parseRange(scanner) catch |e| {
+        scanner.report(e, "Failed parsing range") catch |ee| {
+            switch (scanner.diagnostics) {
+                .disabled => return ee,
+                .enabled => try scanner.diagnostics.enabled.printRaise(ee),
+            }
+        };
+    };
+
     return range;
 }
 
 test "Parse ranges" {
     const t = std.testing;
+    const tt = regent.testing;
     var diag: Scanner.DiagnosticTracker = undefined;
+    var scanner: Scanner = undefined;
+    scanner.initWithDiag(t.allocator, &diag, "");
     defer diag.deinit();
+    const MAX_USIZE = std.math.maxInt(usize);
 
-    try t.expectEqual(
-        @as(Range, .{ .min = 1, .max = 2 }),
-        testParse(t.allocator, &diag, "1,2}") catch |e| try diag.printRaise(e),
-    );
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{0}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{0 }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0 }"));
+    try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{1}"));
+    try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{ 1}"));
+    try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{1 }"));
+    try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{ 1 }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{,}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{ ,}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{, }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{ , }"));
+    try tt.expectEqual(Range, .{ .min = 12, .max = MAX_USIZE }, try testParse(&scanner, "{12,}"));
+    try tt.expectEqual(Range, .{ .min = 42, .max = MAX_USIZE }, try testParse(&scanner, "{ 42,}"));
+    try tt.expectEqual(Range, .{ .min = 73, .max = MAX_USIZE }, try testParse(&scanner, "{ 73 ,}"));
+    try tt.expectEqual(Range, .{ .min = 123, .max = MAX_USIZE }, try testParse(&scanner, "{ 123 , }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 32 }, try testParse(&scanner, "{,32}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 11 }, try testParse(&scanner, "{ ,11}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 888 }, try testParse(&scanner, "{ , 888}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 999 }, try testParse(&scanner, "{ , 999 }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{0,0}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0,0}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0 ,0}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0 , 0}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0 , 0 }"));
+    try tt.expectEqual(Range, .{ .min = 13, .max = 15 }, try testParse(&scanner, "{13,15}"));
+    try tt.expectEqual(Range, .{ .min = 13, .max = 15 }, try testParse(&scanner, "{ 13,15}"));
+    try tt.expectEqual(Range, .{ .min = 13, .max = 15 }, try testParse(&scanner, "{ 13 ,15}"));
+    try tt.expectEqual(Range, .{ .min = 13, .max = 15 }, try testParse(&scanner, "{ 13 , 15}"));
+    try tt.expectEqual(Range, .{ .min = 13, .max = 15 }, try testParse(&scanner, "{ 13 , 15 }"));
+}
+
+test "fail to parse range" {
+    const t = std.testing;
+    var scanner: Scanner = .{ .pattern = "" };
+
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, ""));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "a"));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "{a"));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "{}"));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{0"));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{ "));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{, "));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "{01"));
+    try t.expectError(Error.Overflow, testParse(&scanner, "{18446744073709551616,}"));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{1 "));
+    try t.expectError(Error.Overflow, testParse(&scanner, "{1,18446744073709551616}"));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "{1x"));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{1, "));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{1,0 "));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "{1,x"));
+    try t.expectError(Error.UnexpectedEnd, testParse(&scanner, "{1,3 "));
+    try t.expectError(Error.StartSmallerThanEnd, testParse(&scanner, "{3,2}"));
+    try t.expectError(Error.SyntaxError, testParse(&scanner, "{2,3x"));
 }

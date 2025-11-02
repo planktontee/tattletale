@@ -7,6 +7,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{
+                .name = "regent",
+                .module = b.dependency(
+                    "regent",
+                    .{ .target = target, .optimize = optimize },
+                ).module("regent"),
+            },
+        },
     });
 
     const lib_unit_tests = b.addTest(.{
