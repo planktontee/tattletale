@@ -1,38 +1,45 @@
 const std = @import("std");
+const Range = @import("range.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Diagnostics = union(enum) {
     disabled,
-    enabled: struct {
-        allocator: Allocator,
-        idx: *const usize,
-        pattern: []const u8,
-        message: ?[:0]u8 = null,
-
-        pub fn messageRef(self: *@This(), size: usize) Allocator.Error![:0]u8 {
-            if (self.message) |msg| {
-                if (msg.len <= size) {
-                    return msg[0..size :0];
-                } else {
-                    self.message = self.allocator.remap(self.message, size) orelse return Allocator.Error.OutOfMemory;
-                    return self.message;
-                }
-            } else {
-                self.message = try self.allocator.alloc(u8, size);
-                return self.message;
-            }
-        }
-
-        pub fn deinit(self: *@This()) void {
-            self.allocator.free(self.message);
-            self.message = undefined;
-        }
-    },
+    enabled: *DiagnosticTracker,
 };
 
-pub const Range = struct {
-    min: usize,
-    max: usize,
+pub const DiagnosticTracker = struct {
+    allocator: Allocator,
+    idx: *const usize,
+    pattern: []const u8,
+    buff: ?[]u8 = null,
+    message: ?[]const u8 = null,
+
+    pub const MakeBuff = Allocator.Error;
+    pub fn makeBuff(self: *@This(), size: usize) MakeBuff![]u8 {
+        if (self.buff) |buff| {
+            if (buff.len <= size) {
+                return buff[0..size];
+            } else {
+                self.buff = self.allocator.remap(buff, size) orelse return Allocator.Error.OutOfMemory;
+                return self.buff.?;
+            }
+        } else {
+            self.buff = try self.allocator.alloc(u8, size);
+            return self.buff.?;
+        }
+    }
+
+    pub fn printRaise(self: *const @This(), e: anyerror) anyerror!noreturn {
+        std.debug.print("{s}\n", .{self.message.?});
+        return e;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        if (self.buff) |buff| {
+            self.allocator.free(buff);
+        }
+        self.buff = undefined;
+    }
 };
 
 pub const Token = union(enum) {
@@ -71,7 +78,6 @@ const State = union(enum) {
 
     seekPiece,
 
-    initialRange,
     anyGreedy,
     moreGreedy,
 
@@ -83,13 +89,33 @@ pattern: []const u8,
 i: usize = 0,
 diagnostics: Diagnostics = .disabled,
 
+pub fn initWithDiag(
+    self: *@This(),
+    allocator: Allocator,
+    diag: *DiagnosticTracker,
+    pattern: []const u8,
+) void {
+    self.* = .{ .pattern = pattern };
+    diag.* = .{
+        .allocator = allocator,
+        .idx = &self.i,
+        .pattern = pattern,
+    };
+    self.diagnostics = .{ .enabled = diag };
+}
+
 pub const Error = error{
     TBA,
     Bad2ByteUTF8Start,
     InvalidUTF8Byte1,
 
+    UnexpectedRangeEnd,
+
     RangeEndBeforeStart,
-};
+} ||
+    Range.Error ||
+    DiagnosticTracker.MakeBuff ||
+    std.fmt.BufPrintError;
 
 pub fn next(self: *@This()) Error!Token {
     stateLoop: while (true) {
@@ -142,9 +168,31 @@ pub fn next(self: *@This()) Error!Token {
                     // 0x7B
                     '{',
                     => {
-                        self.state = .initialRange;
                         self.i += 1;
-                        continue :stateLoop;
+                        var range: Range = undefined;
+                        try range.parseRange(self);
+                        self.state = .seekPiece;
+
+                        if (self.i >= self.pattern.len) {
+                            self.state = .seekPiece;
+                            return .{
+                                .quantifier = .{ .rangeGreedy = range },
+                            };
+                        }
+
+                        switch (self.pattern[self.i]) {
+                            '?' => {
+                                self.i += 1;
+                                return .{
+                                    .quantifier = .{ .rangeLazy = range },
+                                };
+                            },
+                            else => {
+                                return .{
+                                    .quantifier = .{ .rangeGreedy = range },
+                                };
+                            },
+                        }
                     },
                     // 0x7D
                     '}' => return Error.RangeEndBeforeStart,
@@ -250,8 +298,6 @@ pub fn next(self: *@This()) Error!Token {
                     },
                 }
             },
-            .initialRange,
-            => {},
             .done => return .done,
         }
         return Error.TBA;
@@ -259,24 +305,72 @@ pub fn next(self: *@This()) Error!Token {
     unreachable;
 }
 
+pub const ConsumeError = error{
+    UnexpectedEnd,
+};
+
+pub fn consumeWhite(self: *Scanner) ConsumeError!void {
+    while (self.i < self.pattern.len) : (self.i += 1) {
+        switch (self.pattern[self.i]) {
+            ' ',
+            '\t',
+            => continue,
+            else => break,
+        }
+    } else return ConsumeError.UnexpectedEnd;
+}
+
+pub fn consumeDigits(self: *Scanner) ConsumeError!void {
+    while (self.i < self.pattern.len) : (self.i += 1) {
+        switch (self.pattern[self.i]) {
+            '0'...'9',
+            => continue,
+            else => break,
+        }
+    } else return ConsumeError.UnexpectedEnd;
+}
+
 const Scanner = @This();
 
-pub fn initWithDiag(allocator: Allocator, pattern: []const u8) Scanner {
-    var scanner: Scanner = .{
-        .pattern = pattern,
-    };
-    scanner.diagnostics = .{
-        .enabled = .{ .allocator = allocator, .idx = &scanner.i, .pattern = pattern },
-    };
-    return scanner;
+pub fn report(self: *Scanner, e: Error, comptime message: []const u8) Error!noreturn {
+    if (self.diagnostics == .disabled) return e;
+    var diag = self.diagnostics.enabled;
+    const buff: []u8 = try diag.makeBuff(4098);
+    diag.message = try std.fmt.bufPrint(
+        buff,
+        "{s} - {s}<{c}>{s} - " ++ message,
+        .{
+            @errorName(e),
+            self.pattern[0..self.i],
+            self.pattern[self.i],
+            if (self.i + 1 >= self.pattern.len) "" else self.pattern[self.i + 1 ..],
+        },
+    );
+    return e;
+}
+
+pub fn collect(self: *Scanner, tokens: []Token) Error![]const Token {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const token = self.next() catch |e| try self.report(e, "Failed collection");
+        tokens[i] = token;
+        if (token == .done) {
+            i += 1;
+            break;
+        }
+    }
+    return tokens[0..i];
 }
 
 test "Parse tokens" {
     const t = std.testing;
 
     const pattern: []const u8 = "ab+?c?de*f*?";
-    var scanner: Scanner = .initWithDiag(t.allocator, pattern);
-    try t.expectEqualDeep(@as([]const Token, &.{
+    var scanner: Scanner = undefined;
+    var diag: DiagnosticTracker = undefined;
+    defer diag.deinit();
+    scanner.initWithDiag(t.allocator, &diag, pattern);
+    const expected: []const Token = &.{
         .branchStart,
         .{ .atom = 'a' },
         .{ .atom = 'b' },
@@ -289,18 +383,37 @@ test "Parse tokens" {
         .{ .atom = 'f' },
         .{ .quantifier = .anyLazy },
         .done,
-    }), &.{
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-        try scanner.next(),
-    });
+    };
+    var tokens: [expected.len]Token = undefined;
+    const result = scanner.collect(&tokens) catch |e| try diag.printRaise(e);
+    try t.expectEqualDeep(expected, result);
+}
+
+test "Parse ranges" {
+    const t = std.testing;
+
+    const pattern: []const u8 = "a{,}b{12}?";
+    var scanner: Scanner = undefined;
+    var diag: DiagnosticTracker = undefined;
+    defer diag.deinit();
+    scanner.initWithDiag(t.allocator, &diag, pattern);
+    const expected: []const Token = &.{
+        .branchStart,
+        .{ .atom = 'a' },
+        .{
+            .quantifier = .{
+                .rangeGreedy = .{ .min = 0, .max = 0 },
+            },
+        },
+        .{ .atom = 'b' },
+        .{
+            .quantifier = .{
+                .rangeLazy = .{ .min = 12, .max = 12 },
+            },
+        },
+        .done,
+    };
+    var tokens: [expected.len]Token = undefined;
+    const result = scanner.collect(&tokens) catch |e| try diag.printRaise(e);
+    try t.expectEqualDeep(expected, result);
 }
