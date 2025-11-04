@@ -1,15 +1,11 @@
 const std = @import("std");
+const Writer = std.Io.Writer;
 const regent = @import("regent");
 const assert = std.debug.assert;
 const Range = @import("range.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Diagnostics = union(enum) {
-    disabled,
-    enabled: *DiagnosticTracker,
-};
-
-pub const DiagnosticTracker = struct {
+pub const Diagnostics = struct {
     allocator: Allocator,
     idx: *const usize,
     pattern: []const u8,
@@ -56,6 +52,28 @@ pub const Token = union(enum) {
     quantifier: Quantifier,
 
     done,
+
+    pub fn format(self: *const Token, w: *Writer) Writer.Error!void {
+        try w.writeAll(".");
+        try w.writeAll(@tagName(self.*));
+        switch (self.*) {
+            .branchStart,
+            .branchEnd,
+            .done,
+            => {},
+            .atom,
+            => |atom| {
+                try w.writeAll("<");
+                try w.writeAll(&.{atom});
+                try w.writeAll(">");
+            },
+            .quantifier => |quantifier| {
+                try w.writeAll("<");
+                try quantifier.format(w);
+                try w.writeAll(">");
+            },
+        }
+    }
 };
 
 pub const Quantifier = union(enum) {
@@ -67,36 +85,50 @@ pub const Quantifier = union(enum) {
     moreGreedy,
     moreLazy,
 
-    minGreedy: usize,
-    minLazy: usize,
-
-    maxGreedy: usize,
-    maxLazy: usize,
-
     rangeGreedy: Range,
     rangeLazy: Range,
+
+    pub fn format(self: *const Quantifier, w: *Writer) Writer.Error!void {
+        try w.writeAll(switch (self.*) {
+            .optional => "?",
+            .anyGreedy => "*",
+            .anyLazy => "*?",
+            .moreGreedy => "+",
+            .moreLazy => "+?",
+            .rangeGreedy => |range| {
+                try range.format(w);
+                return;
+            },
+            .rangeLazy => |range| rv: {
+                try range.format(w);
+                break :rv "?";
+            },
+        });
+    }
 };
 
 const State = union(enum) {
-    init,
+    branchStart,
 
     seekPiece,
 
     anyGreedy,
     moreGreedy,
 
+    branchEnd,
+
     done,
 };
 
-state: State = .init,
+state: State = .branchStart,
 pattern: []const u8,
 i: usize = 0,
-diagnostics: Diagnostics = .disabled,
+diagnostics: ?*Diagnostics = null,
 
 pub fn initWithDiag(
     self: *@This(),
     allocator: Allocator,
-    diag: *DiagnosticTracker,
+    diag: *Diagnostics,
     pattern: []const u8,
 ) void {
     self.* = .{ .pattern = pattern };
@@ -105,7 +137,7 @@ pub fn initWithDiag(
         .idx = &self.i,
         .pattern = pattern,
     };
-    self.diagnostics = .{ .enabled = diag };
+    self.diagnostics = diag;
 }
 
 pub const Error = error{
@@ -118,15 +150,15 @@ pub const Error = error{
     RangeEndBeforeStart,
 } ||
     Range.Error ||
-    DiagnosticTracker.MakeBuff ||
+    Diagnostics.MakeBuff ||
     std.fmt.BufPrintError;
 
 pub fn next(self: *@This()) Error!Token {
     stateLoop: while (true) {
         switch (self.state) {
-            .init => {
+            .branchStart => {
                 if (self.finished()) {
-                    self.state = .done;
+                    self.state = .branchEnd;
                     continue :stateLoop;
                 }
                 self.state = .seekPiece;
@@ -134,7 +166,7 @@ pub fn next(self: *@This()) Error!Token {
             },
             .seekPiece => {
                 if (self.finished()) {
-                    self.state = .done;
+                    self.state = .branchEnd;
                     continue :stateLoop;
                 }
                 switch (self.peek()) {
@@ -176,7 +208,7 @@ pub fn next(self: *@This()) Error!Token {
                         try range.parseRange(self);
 
                         if (self.finished()) {
-                            self.state = .done;
+                            self.state = .branchEnd;
                             return .{
                                 .quantifier = .{ .rangeGreedy = range },
                             };
@@ -268,7 +300,7 @@ pub fn next(self: *@This()) Error!Token {
             .anyGreedy,
             => {
                 if (self.finished()) {
-                    self.state = .done;
+                    self.state = .branchEnd;
                     return .{ .quantifier = .anyGreedy };
                 }
                 switch (self.peek()) {
@@ -286,7 +318,7 @@ pub fn next(self: *@This()) Error!Token {
             .moreGreedy,
             => {
                 if (self.finished()) {
-                    self.state = .done;
+                    self.state = .branchEnd;
                     return .{ .quantifier = .moreGreedy };
                 }
                 switch (self.peek()) {
@@ -300,6 +332,14 @@ pub fn next(self: *@This()) Error!Token {
                         return .{ .quantifier = .moreGreedy };
                     },
                 }
+            },
+            .branchEnd => {
+                if (self.finished()) {
+                    self.state = .done;
+                } else {
+                    self.state.branchStart;
+                }
+                return .branchEnd;
             },
             .done => return .done,
         }
@@ -364,8 +404,8 @@ pub fn consumeDigits(self: *Scanner) ConsumeError!void {
 const Scanner = @This();
 
 pub fn report(self: *Scanner, e: Error, comptime message: []const u8) Error!noreturn {
-    if (self.diagnostics == .disabled) return e;
-    var diag = self.diagnostics.enabled;
+    if (self.diagnostics == null) return e;
+    var diag = self.diagnostics.?;
     const buff: []u8 = try diag.makeBuff(4098);
     diag.message = try std.fmt.bufPrint(
         buff,
@@ -398,7 +438,7 @@ test "Parse tokens" {
 
     const pattern: []const u8 = "ab+?c?de*f*?";
     var scanner: Scanner = undefined;
-    var diag: DiagnosticTracker = undefined;
+    var diag: Diagnostics = undefined;
     defer diag.deinit();
     scanner.initWithDiag(t.allocator, &diag, pattern);
     const expected: []const Token = &.{
@@ -413,6 +453,7 @@ test "Parse tokens" {
         .{ .quantifier = .anyGreedy },
         .{ .atom = 'f' },
         .{ .quantifier = .anyLazy },
+        .branchEnd,
         .done,
     };
     var tokens: [expected.len]Token = undefined;
@@ -425,7 +466,7 @@ test "Parse ranges" {
 
     const pattern: []const u8 = "a{0}b{12}?c{1,2}";
     var scanner: Scanner = undefined;
-    var diag: DiagnosticTracker = undefined;
+    var diag: Diagnostics = undefined;
     defer diag.deinit();
     scanner.initWithDiag(t.allocator, &diag, pattern);
     const expected: []const Token = &.{
@@ -448,6 +489,7 @@ test "Parse ranges" {
                 .rangeGreedy = .{ .min = 1, .max = 2 },
             },
         },
+        .branchEnd,
         .done,
     };
     var tokens: [expected.len]Token = undefined;

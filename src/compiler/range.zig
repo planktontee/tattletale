@@ -1,4 +1,5 @@
 const std = @import("std");
+const Writer = std.Io.Writer;
 const regent = @import("regent");
 const Scanner = @import("scanner.zig");
 
@@ -148,19 +149,33 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
     unreachable;
 }
 
+pub fn format(self: *const Range, w: *Writer) Writer.Error!void {
+    const buffSize = comptime std.fmt.count("{d}", .{std.math.maxInt(usize)});
+    var startIntBuff: [buffSize]u8 = undefined;
+    var endIntBuff: [buffSize]u8 = undefined;
+
+    const startLen = std.fmt.printInt(&startIntBuff, self.min, 10, .lower, .{});
+    const endLen = std.fmt.printInt(&endIntBuff, self.max, 10, .lower, .{});
+
+    try w.writeAll("{");
+    try w.writeAll(startIntBuff[0..startLen]);
+    try w.writeAll(",");
+    try w.writeAll(endIntBuff[0..endLen]);
+    try w.writeAll("}");
+}
+
 fn testParse(scanner: *Scanner, pattern: []const u8) !Range {
     var range: Range = undefined;
 
     scanner.pattern = pattern;
-    scanner.state = .init;
+    scanner.state = .branchStart;
     scanner.i = 0;
 
     range.parseRange(scanner) catch |e| {
         scanner.report(e, "Failed parsing range") catch |ee| {
-            switch (scanner.diagnostics) {
-                .disabled => return ee,
-                .enabled => try scanner.diagnostics.enabled.printRaise(ee),
-            }
+            if (scanner.diagnostics) |diagnostics| {
+                try diagnostics.printRaise(ee);
+            } else return ee;
         };
     };
 
@@ -170,7 +185,7 @@ fn testParse(scanner: *Scanner, pattern: []const u8) !Range {
 test "Parse ranges" {
     const t = std.testing;
     const tt = regent.testing;
-    var diag: Scanner.DiagnosticTracker = undefined;
+    var diag: Scanner.Diagnostics = undefined;
     var scanner: Scanner = undefined;
     scanner.initWithDiag(t.allocator, &diag, "");
     defer diag.deinit();
