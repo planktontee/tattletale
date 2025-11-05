@@ -8,6 +8,8 @@ max: usize,
 
 const Range = @This();
 
+pub const Unlimited = std.math.maxInt(usize);
+
 pub const Error = error{
     SyntaxError,
     StartSmallerThanEnd,

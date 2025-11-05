@@ -203,4 +203,5 @@ const Visitor = struct {
 
 comptime {
     _ = @import("compiler/scanner.zig");
+    _ = @import("compiler/scanner2.zig");
 }
