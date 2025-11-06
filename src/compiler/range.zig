@@ -31,6 +31,21 @@ const State = enum {
     end,
 };
 
+pub const Any: *const Range = &.{
+    .min = 0,
+    .max = Unlimited,
+};
+
+pub const OneOrMore: *const Range = &.{
+    .min = 1,
+    .max = Unlimited,
+};
+
+pub const Optional: *const Range = &.{
+    .min = 0,
+    .max = 1,
+};
+
 pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
     var state: State = .init;
     var digitsIdx: usize = undefined;
@@ -170,7 +185,7 @@ fn testParse(scanner: *Scanner, pattern: []const u8) !Range {
     var range: Range = undefined;
 
     scanner.pattern = pattern;
-    scanner.state = .branchStart;
+    scanner.state = .init;
     scanner.i = 0;
 
     range.parseRange(scanner) catch |e| {
@@ -187,11 +202,14 @@ fn testParse(scanner: *Scanner, pattern: []const u8) !Range {
 test "Parse ranges" {
     const t = std.testing;
     const tt = regent.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var diag: Scanner.Diagnostics = undefined;
     var scanner: Scanner = undefined;
-    scanner.initWithDiag(t.allocator, &diag, "");
+    try scanner.initWithDiag(allocator, &diag, "");
     defer diag.deinit();
-    const MAX_USIZE = std.math.maxInt(usize);
 
     try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{0}"));
     try tt.expectEqual(Range, .{ .min = 0, .max = 0 }, try testParse(&scanner, "{ 0}"));
@@ -201,14 +219,14 @@ test "Parse ranges" {
     try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{ 1}"));
     try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{1 }"));
     try tt.expectEqual(Range, .{ .min = 1, .max = 1 }, try testParse(&scanner, "{ 1 }"));
-    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{,}"));
-    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{ ,}"));
-    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{, }"));
-    try tt.expectEqual(Range, .{ .min = 0, .max = MAX_USIZE }, try testParse(&scanner, "{ , }"));
-    try tt.expectEqual(Range, .{ .min = 12, .max = MAX_USIZE }, try testParse(&scanner, "{12,}"));
-    try tt.expectEqual(Range, .{ .min = 42, .max = MAX_USIZE }, try testParse(&scanner, "{ 42,}"));
-    try tt.expectEqual(Range, .{ .min = 73, .max = MAX_USIZE }, try testParse(&scanner, "{ 73 ,}"));
-    try tt.expectEqual(Range, .{ .min = 123, .max = MAX_USIZE }, try testParse(&scanner, "{ 123 , }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = Unlimited }, try testParse(&scanner, "{,}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = Unlimited }, try testParse(&scanner, "{ ,}"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = Unlimited }, try testParse(&scanner, "{, }"));
+    try tt.expectEqual(Range, .{ .min = 0, .max = Unlimited }, try testParse(&scanner, "{ , }"));
+    try tt.expectEqual(Range, .{ .min = 12, .max = Unlimited }, try testParse(&scanner, "{12,}"));
+    try tt.expectEqual(Range, .{ .min = 42, .max = Unlimited }, try testParse(&scanner, "{ 42,}"));
+    try tt.expectEqual(Range, .{ .min = 73, .max = Unlimited }, try testParse(&scanner, "{ 73 ,}"));
+    try tt.expectEqual(Range, .{ .min = 123, .max = Unlimited }, try testParse(&scanner, "{ 123 , }"));
     try tt.expectEqual(Range, .{ .min = 0, .max = 32 }, try testParse(&scanner, "{,32}"));
     try tt.expectEqual(Range, .{ .min = 0, .max = 11 }, try testParse(&scanner, "{ ,11}"));
     try tt.expectEqual(Range, .{ .min = 0, .max = 888 }, try testParse(&scanner, "{ , 888}"));
@@ -227,7 +245,13 @@ test "Parse ranges" {
 
 test "fail to parse range" {
     const t = std.testing;
-    var scanner: Scanner = .{ .pattern = "" };
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var scanner: Scanner = undefined;
+    try scanner.init(allocator, "");
 
     try t.expectError(Error.UnexpectedEnd, testParse(&scanner, ""));
     try t.expectError(Error.SyntaxError, testParse(&scanner, "a"));

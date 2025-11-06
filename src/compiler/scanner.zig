@@ -1,8 +1,10 @@
 const std = @import("std");
-const Writer = std.Io.Writer;
 const regent = @import("regent");
+const asPtrConCast = regent.ergo.asPtrConCast;
+const Writer = std.Io.Writer;
 const assert = std.debug.assert;
 const Range = @import("range.zig");
+const Literal = @import("literal.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Diagnostics = struct {
@@ -40,216 +42,156 @@ pub const Diagnostics = struct {
     }
 };
 
-pub const Token = union(enum) {
-    branchStart,
-    branchEnd,
+pub fn init(
+    self: *@This(),
+    allocator: Allocator,
+    pattern: []const u8,
+) !void {
+    try self.initAll(allocator, null, pattern);
+}
 
-    // 1 to 4 bytes (utf8)
-    // escapings
-    // single chars
-    atom: u8,
-
-    quantifier: Quantifier,
-
-    done,
-
-    pub fn format(self: *const Token, w: *Writer) Writer.Error!void {
-        try w.writeAll(".");
-        try w.writeAll(@tagName(self.*));
-        switch (self.*) {
-            .branchStart,
-            .branchEnd,
-            .done,
-            => {},
-            .atom,
-            => |atom| {
-                try w.writeAll("<");
-                try w.writeAll(&.{atom});
-                try w.writeAll(">");
-            },
-            .quantifier => |quantifier| {
-                try w.writeAll("<");
-                try quantifier.format(w);
-                try w.writeAll(">");
-            },
-        }
-    }
-};
-
-pub const Quantifier = union(enum) {
-    optional,
-
-    anyGreedy,
-    anyLazy,
-
-    moreGreedy,
-    moreLazy,
-
-    rangeGreedy: Range,
-    rangeLazy: Range,
-
-    pub fn format(self: *const Quantifier, w: *Writer) Writer.Error!void {
-        try w.writeAll(switch (self.*) {
-            .optional => "?",
-            .anyGreedy => "*",
-            .anyLazy => "*?",
-            .moreGreedy => "+",
-            .moreLazy => "+?",
-            .rangeGreedy => |range| {
-                try range.format(w);
-                return;
-            },
-            .rangeLazy => |range| rv: {
-                try range.format(w);
-                break :rv "?";
-            },
-        });
-    }
-};
-
-const State = union(enum) {
-    branchStart,
-
-    seekPiece,
-
-    anyGreedy,
-    moreGreedy,
-
-    branchEnd,
-
-    done,
-};
-
-state: State = .branchStart,
-pattern: []const u8,
-i: usize = 0,
-diagnostics: ?*Diagnostics = null,
+pub fn initAll(
+    self: *@This(),
+    allocator: Allocator,
+    diagnostics: ?*Diagnostics,
+    pattern: []const u8,
+) !void {
+    self.* = .{
+        .allocator = allocator,
+        .pattern = pattern,
+        .tokens = try .initCapacity(allocator, 8),
+        .stack = try .initCapacity(allocator, 8),
+        .diagnostics = diagnostics,
+    };
+}
 
 pub fn initWithDiag(
     self: *@This(),
     allocator: Allocator,
-    diag: *Diagnostics,
+    diagnostics: *Diagnostics,
     pattern: []const u8,
-) void {
-    self.* = .{ .pattern = pattern };
-    diag.* = .{
+) !void {
+    diagnostics.* = .{
         .allocator = allocator,
         .idx = &self.i,
         .pattern = pattern,
     };
-    self.diagnostics = diag;
+    try self.initAll(allocator, diagnostics, pattern);
 }
+
+pub const Group = struct {
+    n: u16,
+    tokens: []const *const Token,
+};
+
+pub const OpenGroup = struct {
+    n: u16,
+    start: usize,
+
+    pub fn finishGroup(self: *OpenGroup, scanner: *Scanner) Allocator.Error!*const Token {
+        const tokens = try scanner.ownedTokenSliceFrom(self.start);
+        const group = try scanner.punchGroup();
+        group.* = .{
+            .n = self.n,
+            .tokens = tokens,
+        };
+        return scanner.lastTokenAs(.group);
+    }
+};
+
+pub const Repeatable = struct {
+    range: *const Range,
+    token: *const Token,
+    flavour: RepeatableFlavour,
+};
+
+pub const RepeatableFlavour = enum {
+    greedy,
+    lazy,
+};
+
+pub const Token = union(enum) {
+    group0: []const *const Token,
+    group: *const Group,
+    literal: []const u8,
+    repeatable: *Repeatable,
+};
+
+pub const TokenTag = @typeInfo(Token).@"union".tag_type.?;
+
+state: State = .init,
+pattern: []const u8,
+i: usize = 0,
+diagnostics: ?*Diagnostics = null,
+allocator: Allocator,
+
+tokens: std.ArrayListUnmanaged(*const Token),
+stack: std.ArrayListUnmanaged(*OpenGroup),
+currGroup: u16 = 0,
+
+startIdx: usize = 0,
 
 pub const Error = error{
     TBA,
+    UnhandledToken,
+
+    EmptyPattern,
+    PrematureEnd,
+
+    NestedQuantifier,
+
     Bad2ByteUTF8Start,
     InvalidUTF8Byte1,
 
-    UnexpectedRangeEnd,
-
-    RangeEndBeforeStart,
+    UnmatchedGroup,
 } ||
+    std.mem.Allocator.Error ||
     Range.Error ||
     Diagnostics.MakeBuff ||
     std.fmt.BufPrintError;
 
-pub fn next(self: *@This()) Error!Token {
+const State = union(enum) {
+    init,
+    detectToken,
+
+    literalMatch,
+
+    repeatTokenMatch,
+    postRepeat,
+
+    end,
+};
+
+pub fn collect(self: *@This()) Error!*const Token {
+    // TODO: move .startIdx to len so asserts catch it when match is done
     stateLoop: while (true) {
         switch (self.state) {
-            .branchStart => {
-                if (self.finished()) {
-                    self.state = .branchEnd;
-                    continue :stateLoop;
-                }
-                self.state = .seekPiece;
-                return .branchStart;
+            .init => {
+                if (self.finished()) return Error.EmptyPattern;
+                assert(self.stackSize() == 0);
+                _ = try self.startGroup(0);
+                self.state = .detectToken;
+                continue :stateLoop;
             },
-            .seekPiece => {
+            .detectToken => {
                 if (self.finished()) {
-                    self.state = .branchEnd;
+                    self.state = .end;
                     continue :stateLoop;
                 }
                 switch (self.peek()) {
-                    // 0x24
                     '$',
-                    => {},
-                    // 0x28
-                    '(',
-                    => {},
-                    // 0x29
-                    ')',
-                    => {},
-
-                    // Ranges
-                    // 0x2A
-                    '*',
-                    => {
-                        self.consume();
-                        self.state = .anyGreedy;
-                        continue :stateLoop;
-                    },
-                    // 0x2B
-                    '+',
-                    => {
-                        self.consume();
-                        self.state = .moreGreedy;
-                        continue :stateLoop;
-                    },
-                    // 0x3F
-                    '?',
-                    => {
-                        self.consume();
-                        return .{ .quantifier = .optional };
-                    },
-                    // 0x7B
-                    '{',
-                    => {
-                        var range: Range = undefined;
-                        try range.parseRange(self);
-
-                        if (self.finished()) {
-                            self.state = .branchEnd;
-                            return .{
-                                .quantifier = .{ .rangeGreedy = range },
-                            };
-                        }
-
-                        self.state = .seekPiece;
-                        switch (self.peek()) {
-                            '?' => {
-                                self.consume();
-                                return .{
-                                    .quantifier = .{ .rangeLazy = range },
-                                };
-                            },
-                            else => {
-                                return .{
-                                    .quantifier = .{ .rangeGreedy = range },
-                                };
-                            },
-                        }
-                    },
-                    // 0x7D
-                    '}' => return Error.RangeEndBeforeStart,
-
-                    // 0x2E
-                    '.',
-                    => {},
-                    // 0x5B
-                    '[',
-                    => {},
-                    // 0x5C
-                    '\\',
-                    => {},
-                    // 0x5D
-                    ']',
-                    => {},
-                    // 0x5E
                     '^',
-                    => {},
-                    // 0x7C
+                    '.',
+                    '(',
+                    => {
+                        _ = try self.startNextGroup();
+                        self.consume();
+                        continue :stateLoop;
+                    },
+                    '[',
                     '|',
-                    => {},
+                    '\\',
+                    => return Error.TBA,
 
                     // Non-printables
                     0x00...0x1F,
@@ -279,73 +221,426 @@ pub fn next(self: *@This()) Error!Token {
                     '~',
                     0x7F,
                     => {
-                        const token: Token = .{ .atom = self.peek() };
+                        self.state = .literalMatch;
+                        self.startIdx = self.i;
                         self.consume();
-                        return token;
+                        continue :stateLoop;
                     },
 
                     // invalid continuation in utf8 in this state
                     0x80...0xBF => return Error.Bad2ByteUTF8Start,
                     // Those violate shortest encoding rules for 2 bytes
-                    0xC0...0xC1 => {},
+                    0xC0...0xC1 => return Error.TBA,
                     // 2 bytes utf8
-                    0xC2...0xDF => {},
+                    0xC2...0xDF => return Error.TBA,
                     // 3 bytes utf8
-                    0xE0...0xEF => {},
+                    0xE0...0xEF => return Error.TBA,
                     // 4 bytes utf8
-                    0xF0...0xF4 => {},
+                    0xF0...0xF4 => return Error.TBA,
                     0xF5...0xFF => return Error.InvalidUTF8Byte1,
+
+                    // Unmatched errors
+                    ')',
+                    => {
+                        if (self.stackSize() <= 1) return Error.UnmatchedGroup;
+                        _ = try self.finishGroup();
+                        self.consume();
+                        continue :stateLoop;
+                    },
+                    ']',
+                    '{',
+                    '}',
+                    '*',
+                    '+',
+                    '?',
+                    => return Error.SyntaxError,
                 }
             },
-            .anyGreedy,
-            => {
-                if (self.finished()) {
-                    self.state = .branchEnd;
-                    return .{ .quantifier = .anyGreedy };
+            .literalMatch => {
+                literalLoop: while (true) {
+                    if (self.finished()) {
+                        try self.punchLiteral();
+                        self.state = .end;
+                        continue :stateLoop;
+                    }
+                    switch (self.peek()) {
+                        // ranges
+                        '{',
+                        '?',
+                        '*',
+                        '+',
+                        => {
+                            try self.punchLiteralSeqAndTail();
+                            self.state = .repeatTokenMatch;
+                            continue :stateLoop;
+                        },
+
+                        // Unmatched errors
+                        '}',
+                        ']',
+                        => return Error.SyntaxError,
+
+                        // TODO: decide what to do with utf8 in middle of literal
+                        0x80...0xFF => return Error.TBA,
+                        // TODO: decide what to do with scaping in middle of literal
+                        '\\' => return Error.TBA,
+
+                        '$',
+                        '(',
+                        ')',
+                        '[',
+                        '^',
+                        '|',
+                        => {
+                            try self.punchLiteral();
+                            self.state = .detectToken;
+                            continue :stateLoop;
+                        },
+
+                        else => {
+                            self.consume();
+                            continue :literalLoop;
+                        },
+                    }
                 }
+            },
+            .repeatTokenMatch => {
+                switch (self.peek()) {
+                    '{' => {
+                        const range = try self.allocator.create(Range);
+                        try range.parseRange(self);
+                        try self.makeRepeatable(range);
+                        self.state = .postRepeat;
+                        continue :stateLoop;
+                    },
+                    '?' => {
+                        try self.makeRepeatable(Range.Optional);
+                        self.consume();
+                        self.state = .postRepeat;
+                        continue :stateLoop;
+                    },
+                    '*' => {
+                        try self.makeRepeatable(Range.Any);
+                        self.consume();
+                        self.state = .postRepeat;
+                        continue :stateLoop;
+                    },
+                    '+' => {
+                        try self.makeRepeatable(Range.OneOrMore);
+                        self.consume();
+                        self.state = .postRepeat;
+                        continue :stateLoop;
+                    },
+                    else => return Error.SyntaxError,
+                }
+            },
+            .postRepeat => {
                 switch (self.peek()) {
                     '?' => {
+                        const last = self.lastTokenAs(.repeatable);
+                        last.repeatable.flavour = .lazy;
                         self.consume();
-                        self.state = .seekPiece;
-                        return .{ .quantifier = .anyLazy };
+                        continue :stateLoop;
                     },
+                    '{',
+                    '*',
+                    => return Error.NestedQuantifier,
+                    // Possessive quantifier
+                    '+' => return Error.TBA,
                     else => {
-                        self.state = .seekPiece;
-                        return .{ .quantifier = .anyGreedy };
+                        self.state = .detectToken;
+                        continue :stateLoop;
                     },
                 }
             },
-            .moreGreedy,
-            => {
-                if (self.finished()) {
-                    self.state = .branchEnd;
-                    return .{ .quantifier = .moreGreedy };
-                }
-                switch (self.peek()) {
-                    '?' => {
-                        self.consume();
-                        self.state = .seekPiece;
-                        return .{ .quantifier = .moreLazy };
-                    },
-                    else => {
-                        self.state = .seekPiece;
-                        return .{ .quantifier = .moreGreedy };
-                    },
-                }
+            .end => {
+                if (!self.finished()) return Error.PrematureEnd;
+                if (self.stackSize() > 1) return Error.UnmatchedGroup;
+                return try self.finishGroup();
             },
-            .branchEnd => {
-                if (self.finished()) {
-                    self.state = .done;
-                } else {
-                    self.state.branchStart;
-                }
-                return .branchEnd;
-            },
-            .done => return .done,
         }
-        return Error.TBA;
+        return Error.UnhandledToken;
     }
     unreachable;
+}
+
+test "test collect" {
+    const t = std.testing;
+    const tt = regent.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const pattern: []const u8 = "ab+cd?efgh*ij+?klmn*?opqrs{1,3}tuvw{1}?x";
+    var scanner: Scanner = undefined;
+    var diag: Diagnostics = undefined;
+    defer diag.deinit();
+    try scanner.initWithDiag(allocator, &diag, pattern);
+    const group0T = try scanner.collect();
+
+    try tt.expectEqualDeep(*const Token, &.{
+        .group = &.{
+            .n = 0,
+            .tokens = &.{
+                &.{ .literal = "a" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = Range.OneOrMore,
+                        .token = &.{ .literal = "b" },
+                        .flavour = .greedy,
+                    }),
+                },
+                &.{ .literal = "c" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = Range.Optional,
+                        .token = &.{ .literal = "d" },
+                        .flavour = .greedy,
+                    }),
+                },
+                &.{ .literal = "efg" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = Range.Any,
+                        .token = &.{ .literal = "h" },
+                        .flavour = .greedy,
+                    }),
+                },
+                &.{ .literal = "i" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = Range.OneOrMore,
+                        .token = &.{ .literal = "j" },
+                        .flavour = .lazy,
+                    }),
+                },
+                &.{ .literal = "klm" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = Range.Any,
+                        .token = &.{ .literal = "n" },
+                        .flavour = .lazy,
+                    }),
+                },
+                &.{ .literal = "opqr" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = &.{ .min = 1, .max = 3 },
+                        .token = &.{ .literal = "s" },
+                        .flavour = .greedy,
+                    }),
+                },
+                &.{ .literal = "tuv" },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = &.{ .min = 1, .max = 1 },
+                        .token = &.{ .literal = "w" },
+                        .flavour = .lazy,
+                    }),
+                },
+                &.{ .literal = "x" },
+            },
+        },
+    }, group0T);
+}
+
+test "collect groups" {
+    const t = std.testing;
+    const tt = regent.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const pattern: []const u8 = "(a(bc)()c)";
+    var scanner: Scanner = undefined;
+    var diag: Diagnostics = undefined;
+    defer diag.deinit();
+    try scanner.initWithDiag(allocator, &diag, pattern);
+    const group0T = try scanner.collect();
+
+    try tt.expectEqualDeep(*const Token, &.{
+        .group = &.{
+            .n = 0,
+            .tokens = &.{
+                &.{
+                    .group = &.{
+                        .n = 1,
+                        .tokens = &.{
+                            &.{ .literal = "a" },
+                            &.{
+                                .group = &.{
+                                    .n = 2,
+                                    .tokens = &.{&.{ .literal = "bc" }},
+                                },
+                            },
+                            &.{
+                                .group = &.{
+                                    .n = 3,
+                                    .tokens = &.{},
+                                },
+                            },
+                            &.{ .literal = "c" },
+                        },
+                    },
+                },
+            },
+        },
+    }, group0T);
+}
+
+pub inline fn makeRepeatable(self: *Scanner, range: *const Range) Allocator.Error!void {
+    const lastToken = self.popToken();
+    const repeatable = try self.allocator.create(Repeatable);
+    repeatable.* = .{
+        .range = range,
+        .token = lastToken,
+        .flavour = .greedy,
+    };
+
+    const repeatableT = try self.punchToken(.repeatable);
+    repeatableT.repeatable = repeatable;
+}
+
+pub inline fn punchLiteralSeqAndTail(self: *Scanner) Allocator.Error!void {
+    // NOTE: this will not work with utf8
+    switch (self.i - self.startIdx) {
+        0 => {
+            assert(false);
+        },
+        1 => {},
+        2 => {
+            const literal = Literal.of(self.peekAt(self.startIdx));
+            try self.appendToken(literal);
+        },
+        else => {
+            const sequence = try self.punchToken(.literal);
+            sequence.literal = self.sliceTo(self.i - 1);
+        },
+    }
+
+    const literal = Literal.of(self.peekPrev());
+    try self.appendToken(literal);
+}
+
+pub inline fn punchLiteral(self: *Scanner) Allocator.Error!void {
+    switch (self.i - self.startIdx) {
+        0 => {
+            assert(false);
+        },
+        1 => {
+            const literal = Literal.of(self.peekAt(self.startIdx));
+            try self.appendToken(literal);
+        },
+        else => {
+            const sequence = try self.punchToken(.literal);
+            sequence.literal = self.slice();
+        },
+    }
+}
+
+pub inline fn slice(self: *const Scanner) []const u8 {
+    assert(self.startIdx <= self.i);
+    assert(self.i <= self.pattern.len);
+
+    return self.pattern[self.startIdx..self.i];
+}
+
+pub inline fn sliceTo(self: *const Scanner, end: usize) []const u8 {
+    assert(self.startIdx <= end);
+    assert(end <= self.pattern.len);
+
+    return self.pattern[self.startIdx..end];
+}
+
+pub inline fn sliceFrom(self: *const Scanner, start: usize) []const u8 {
+    assert(start < self.pattern.len);
+    assert(start < self.i);
+    return self.pattern[start..self.i];
+}
+
+pub inline fn ownedTokenSliceFrom(self: *Scanner, start: usize) Allocator.Error![]const *const Token {
+    const newTokenSlice = try self.allocator.alloc(*const Token, self.tokenCount() - start);
+    @memcpy(newTokenSlice, self.tokens.items[start..]);
+    const targetLen = self.tokenCount() - newTokenSlice.len;
+    self.tokens.shrinkRetainingCapacity(targetLen);
+    assert(self.tokenCount() == targetLen);
+    return newTokenSlice;
+}
+
+pub inline fn popNTokens(self: *Scanner, lastN: usize) void {
+    assert(self.tokenCount() >= lastN);
+    self.tokens.shrinkRetainingCapacity(self.tokenCount() - lastN);
+}
+
+pub inline fn finishGroup(self: *Scanner) Allocator.Error!*const Token {
+    assert(self.stack.items.len > 0);
+    const openGroup = self.stack.pop().?;
+    return try openGroup.finishGroup(self);
+}
+
+pub inline fn lastTokenAs(self: *Scanner, comptime tokenTag: TokenTag) *const Token {
+    assert(self.tokenCount() > 0);
+    const token = self.tokens.items[self.currToken()];
+    // Should this be an actual error check?
+    assert(token.* == tokenTag);
+    return token;
+}
+
+pub inline fn punchToken(self: *Scanner, comptime tokenTag: TokenTag) Allocator.Error!*Token {
+    const newToken = try self.allocator.create(Token);
+    newToken.* = @unionInit(Token, @tagName(tokenTag), undefined);
+    try self.appendToken(newToken);
+    return newToken;
+}
+
+pub inline fn punchGroup(self: *Scanner) Allocator.Error!*Group {
+    const group = try self.allocator.create(Group);
+    const newToken = try self.allocator.create(Token);
+    newToken.* = .{ .group = group };
+    try self.appendToken(newToken);
+    return group;
+}
+
+pub inline fn startNextGroup(self: *Scanner) Error!*OpenGroup {
+    return try self.startGroup(self.currGroup + 1);
+}
+
+pub inline fn startGroup(self: *Scanner, n: u16) Error!*OpenGroup {
+    const openGroup = try self.allocator.create(OpenGroup);
+    openGroup.* = .{
+        .n = n,
+        .start = self.tokenCount(),
+    };
+    try self.stackGroup(openGroup);
+    return openGroup;
+}
+
+pub inline fn stackGroup(self: *Scanner, openGroup: *OpenGroup) Allocator.Error!void {
+    try self.stack.append(self.allocator, openGroup);
+    self.currGroup = openGroup.n;
+}
+
+pub inline fn appendToken(self: *Scanner, token: *const Token) Allocator.Error!void {
+    try self.tokens.append(self.allocator, token);
+}
+
+pub inline fn popToken(self: *Scanner) *const Token {
+    assert(self.currToken() > 0);
+    return self.tokens.pop().?;
+}
+
+pub inline fn stackSize(self: *const Scanner) usize {
+    return self.stack.items.len;
+}
+
+pub inline fn tokenCount(self: *const Scanner) usize {
+    return self.tokens.items.len;
+}
+
+pub inline fn currToken(self: *const Scanner) usize {
+    const tokensLen = self.tokenCount();
+    assert(tokensLen > 0);
+    return tokensLen - 1;
 }
 
 pub inline fn finished(self: *const Scanner) bool {
@@ -361,15 +656,19 @@ pub inline fn consume(self: *Scanner) void {
     self.i += 1;
 }
 
+pub inline fn peekPrev(self: *const Scanner) u8 {
+    return self.peekAt(self.i - 1);
+}
+
+pub inline fn peekAt(self: *const Scanner, i: usize) u8 {
+    assert(i >= 0);
+    assert(i < self.pattern.len);
+    return self.pattern[i];
+}
+
 pub inline fn peek(self: *const Scanner) u8 {
     assert(self.hasNext());
     return self.pattern[self.i];
-}
-
-pub inline fn sliceFrom(self: *const Scanner, start: usize) []const u8 {
-    assert(start < self.pattern.len);
-    assert(start < self.i);
-    return self.pattern[start..self.i];
 }
 
 pub inline fn ensureByte(self: *const Scanner) ConsumeError!void {
@@ -418,81 +717,4 @@ pub fn report(self: *Scanner, e: Error, comptime message: []const u8) Error!nore
         },
     );
     return e;
-}
-
-pub fn collect(self: *Scanner, tokens: []Token) Error![]const Token {
-    var i: usize = 0;
-    while (i < tokens.len) : (i += 1) {
-        const token = self.next() catch |e| try self.report(e, "Failed collection");
-        tokens[i] = token;
-        if (token == .done) {
-            i += 1;
-            break;
-        }
-    }
-    return tokens[0..i];
-}
-
-test "Parse tokens" {
-    const t = std.testing;
-
-    const pattern: []const u8 = "ab+?c?de*f*?";
-    var scanner: Scanner = undefined;
-    var diag: Diagnostics = undefined;
-    defer diag.deinit();
-    scanner.initWithDiag(t.allocator, &diag, pattern);
-    const expected: []const Token = &.{
-        .branchStart,
-        .{ .atom = 'a' },
-        .{ .atom = 'b' },
-        .{ .quantifier = .moreLazy },
-        .{ .atom = 'c' },
-        .{ .quantifier = .optional },
-        .{ .atom = 'd' },
-        .{ .atom = 'e' },
-        .{ .quantifier = .anyGreedy },
-        .{ .atom = 'f' },
-        .{ .quantifier = .anyLazy },
-        .branchEnd,
-        .done,
-    };
-    var tokens: [expected.len]Token = undefined;
-    const result = scanner.collect(&tokens) catch |e| try diag.printRaise(e);
-    try t.expectEqualDeep(expected, result);
-}
-
-test "Parse ranges" {
-    const t = std.testing;
-
-    const pattern: []const u8 = "a{0}b{12}?c{1,2}";
-    var scanner: Scanner = undefined;
-    var diag: Diagnostics = undefined;
-    defer diag.deinit();
-    scanner.initWithDiag(t.allocator, &diag, pattern);
-    const expected: []const Token = &.{
-        .branchStart,
-        .{ .atom = 'a' },
-        .{
-            .quantifier = .{
-                .rangeGreedy = .{ .min = 0, .max = 0 },
-            },
-        },
-        .{ .atom = 'b' },
-        .{
-            .quantifier = .{
-                .rangeLazy = .{ .min = 12, .max = 12 },
-            },
-        },
-        .{ .atom = 'c' },
-        .{
-            .quantifier = .{
-                .rangeGreedy = .{ .min = 1, .max = 2 },
-            },
-        },
-        .branchEnd,
-        .done,
-    };
-    var tokens: [expected.len]Token = undefined;
-    const result = scanner.collect(&tokens) catch |e| try diag.printRaise(e);
-    try t.expectEqualDeep(expected, result);
 }

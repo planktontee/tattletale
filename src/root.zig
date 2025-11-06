@@ -1,3 +1,3 @@
 comptime {
-    _ = @import("compiler.zig");
+    _ = @import("compiler/scanner.zig");
 }
