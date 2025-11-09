@@ -3,27 +3,44 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const regent = b.dependency(
+        "regent",
+        .{ .target = target, .optimize = optimize },
+    ).module("regent");
+
     const tattletale = b.addModule("tattletale", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("tattletale.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{
                 .name = "regent",
-                .module = b.dependency(
-                    "regent",
-                    .{ .target = target, .optimize = optimize },
-                ).module("regent"),
+                .module = regent,
             },
         },
     });
 
-    const lib_unit_tests = b.addTest(.{
-        .root_module = tattletale,
+    const tests = b.addTest(.{
+        .root_module = b.addModule("test", .{
+            .root_source_file = b.path("test/test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{
+                    .name = "regent",
+                    .module = regent,
+                },
+                .{
+                    .name = "tattletale",
+                    .module = tattletale,
+                },
+            },
+        }),
     });
 
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    const testArtifact = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&testArtifact.step);
 }
