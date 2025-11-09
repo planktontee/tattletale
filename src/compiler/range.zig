@@ -47,123 +47,109 @@ pub const Optional: *const Range = &.{
 };
 
 pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
-    var state: State = .init;
     var digitsIdx: usize = undefined;
 
-    stateLoop: while (true) {
-        switch (state) {
-            .init => {
-                try scanner.ensureByte();
-                switch (scanner.peek()) {
-                    '{',
-                    => {
-                        scanner.consume();
-                        state = .initStartParse;
-                        continue :stateLoop;
-                    },
-                    else => return Error.SyntaxError,
-                }
-            },
-            .initStartParse => {
-                try scanner.consumeWhite();
-                switch (scanner.peek()) {
-                    '0',
-                    => {
-                        scanner.consume();
-                        self.min = 0;
-                        try scanner.consumeWhite();
-                        state = .seekComma;
-                        continue :stateLoop;
-                    },
-                    '1'...'9',
-                    => {
-                        digitsIdx = scanner.i;
-                        scanner.consume();
-                        state = .startParse;
-                        continue :stateLoop;
-                    },
-                    ',' => {
-                        self.min = 0;
-                        try scanner.consumeWhite();
-                        state = .seekComma;
-                        continue :stateLoop;
-                    },
-                    else => return Error.SyntaxError,
-                }
-            },
-            .startParse => {
-                try scanner.consumeDigits();
-                const digits = scanner.sliceFrom(digitsIdx);
-                try scanner.consumeWhite();
-                self.min = try std.fmt.parseInt(usize, digits, 10);
-                state = .seekComma;
-                continue :stateLoop;
-            },
-            .seekComma => {
-                switch (scanner.peek()) {
-                    ',',
-                    => {
-                        scanner.consume();
-                        state = .initEndParse;
-                        continue :stateLoop;
-                    },
-                    '}',
-                    => {
-                        self.max = self.min;
-                        state = .end;
-                    },
-                    else => return Error.SyntaxError,
-                }
-            },
-            .initEndParse => {
-                try scanner.consumeWhite();
-                switch (scanner.peek()) {
-                    '0',
-                    => {
-                        scanner.consume();
-                        self.max = 0;
-                        try scanner.consumeWhite();
-                        state = .end;
-                        continue :stateLoop;
-                    },
-                    '1'...'9',
-                    => {
-                        digitsIdx = scanner.i;
-                        scanner.consume();
-                        state = .endParse;
-                        continue :stateLoop;
-                    },
-                    '}' => {
-                        self.max = std.math.maxInt(usize);
-                        state = .end;
-                        try scanner.consumeWhite();
-                        continue :stateLoop;
-                    },
-                    else => return Error.SyntaxError,
-                }
-            },
-            .endParse => {
-                try scanner.consumeDigits();
-                const digits = scanner.sliceFrom(digitsIdx);
-                try scanner.consumeWhite();
-                self.max = try std.fmt.parseInt(usize, digits, 10);
-                state = .end;
-                continue :stateLoop;
-            },
-            .end => {
-                if (self.min > self.max) return Error.StartSmallerThanEnd;
-                switch (scanner.peek()) {
-                    '}',
-                    => {
-                        scanner.consume();
-                        return;
-                    },
-                    else => return Error.SyntaxError,
-                }
-            },
-        }
+    stateLoop: switch (State.init) {
+        .init => {
+            try scanner.ensureByte();
+            switch (scanner.peek()) {
+                '{',
+                => {
+                    scanner.consume();
+                    continue :stateLoop .initStartParse;
+                },
+                else => return Error.SyntaxError,
+            }
+        },
+        .initStartParse => {
+            try scanner.consumeWhite();
+            switch (scanner.peek()) {
+                '0',
+                => {
+                    scanner.consume();
+                    self.min = 0;
+                    try scanner.consumeWhite();
+                    continue :stateLoop .seekComma;
+                },
+                '1'...'9',
+                => {
+                    digitsIdx = scanner.i;
+                    scanner.consume();
+                    continue :stateLoop .startParse;
+                },
+                ',' => {
+                    self.min = 0;
+                    try scanner.consumeWhite();
+                    continue :stateLoop .seekComma;
+                },
+                else => return Error.SyntaxError,
+            }
+        },
+        .startParse => {
+            try scanner.consumeDigits();
+            const digits = scanner.sliceFrom(digitsIdx);
+            try scanner.consumeWhite();
+            self.min = try std.fmt.parseInt(usize, digits, 10);
+            continue :stateLoop .seekComma;
+        },
+        .seekComma => {
+            switch (scanner.peek()) {
+                ',',
+                => {
+                    scanner.consume();
+                    continue :stateLoop .initEndParse;
+                },
+                '}',
+                => {
+                    self.max = self.min;
+                    continue :stateLoop .end;
+                },
+                else => return Error.SyntaxError,
+            }
+        },
+        .initEndParse => {
+            try scanner.consumeWhite();
+            switch (scanner.peek()) {
+                '0',
+                => {
+                    scanner.consume();
+                    self.max = 0;
+                    try scanner.consumeWhite();
+                    continue :stateLoop .end;
+                },
+                '1'...'9',
+                => {
+                    digitsIdx = scanner.i;
+                    scanner.consume();
+                    continue :stateLoop .endParse;
+                },
+                '}' => {
+                    self.max = std.math.maxInt(usize);
+                    try scanner.consumeWhite();
+                    continue :stateLoop .end;
+                },
+                else => return Error.SyntaxError,
+            }
+        },
+        .endParse => {
+            try scanner.consumeDigits();
+            const digits = scanner.sliceFrom(digitsIdx);
+            try scanner.consumeWhite();
+            self.max = try std.fmt.parseInt(usize, digits, 10);
+            continue :stateLoop .end;
+        },
+        .end => {
+            if (self.min > self.max) return Error.StartSmallerThanEnd;
+            switch (scanner.peek()) {
+                '}',
+                => {
+                    scanner.consume();
+                    return;
+                },
+                else => return Error.SyntaxError,
+            }
+        },
     }
-    unreachable;
 }
 
 pub fn format(self: *const Range, w: *Writer) Writer.Error!void {
@@ -185,7 +171,6 @@ fn testParse(scanner: *Scanner, pattern: []const u8) !Range {
     var range: Range = undefined;
 
     scanner.pattern = pattern;
-    scanner.state = .init;
     scanner.i = 0;
 
     range.parseRange(scanner) catch |e| {

@@ -119,7 +119,6 @@ pub const Token = union(enum) {
 
 pub const TokenTag = @typeInfo(Token).@"union".tag_type.?;
 
-state: State = .init,
 pattern: []const u8,
 i: usize = 0,
 diagnostics: ?*Diagnostics = null,
@@ -162,206 +161,204 @@ const State = union(enum) {
     end,
 };
 
+pub fn collectWithReport(self: *@This()) Error!*const Token {
+    const token = self.collect() catch |e| {
+        try self.report(e, "Failed IR");
+    };
+    return token;
+}
+
 pub fn collect(self: *@This()) Error!*const Token {
-    // TODO: move .startIdx to len so asserts catch it when match is done
-    stateLoop: while (true) {
-        switch (self.state) {
-            .init => {
-                if (self.finished()) return Error.EmptyPattern;
-                assert(self.stackSize() == 0);
-                _ = try self.startGroup(0);
-                self.state = .detectToken;
-                continue :stateLoop;
-            },
-            .detectToken => {
+    stateLoop: switch (State.init) {
+        .init => {
+            if (self.finished()) return Error.EmptyPattern;
+            assert(self.stackSize() == 0);
+
+            _ = try self.startGroup(0);
+            continue :stateLoop .detectToken;
+        },
+        .detectToken => {
+            if (self.finished()) continue :stateLoop .end;
+            switch (self.peek()) {
+                '$',
+                '^',
+                '.',
+                '[',
+                '|',
+                '\\',
+                ']',
+                => return Error.TBA,
+
+                '(',
+                => {
+                    try self.startNextGroup();
+                    self.consume();
+                    continue :stateLoop .detectToken;
+                },
+
+                // Non-printables
+                0x00...0x1F,
+                // [ !"#]
+                0x20...0x23,
+                // [%&']
+                0x25...0x27,
+                // [,-]
+                0x2C...0x2D,
+                // 0x2F
+                '/',
+                // 0x30 - 0x39
+                '0'...'9',
+                // [:;<=>]
+                0x3A...0x3E,
+                // 0x40
+                '@',
+                // 0x41 - 0x5A
+                'A'...'Z',
+                // 0x5F
+                '_',
+                // 0x60
+                '`',
+                // 0x61 - 7A
+                'a'...'z',
+                // 0x7E
+                '~',
+                0x7F,
+                => {
+                    self.tagStart();
+                    self.consume();
+                    continue :stateLoop .literalMatch;
+                },
+
+                // invalid continuation in utf8 in this state
+                0x80...0xBF => return Error.Bad2ByteUTF8Start,
+                // Those violate shortest encoding rules for 2 bytes
+                0xC0...0xC1 => return Error.TBA,
+                // 2 bytes utf8
+                0xC2...0xDF => return Error.TBA,
+                // 3 bytes utf8
+                0xE0...0xEF => return Error.TBA,
+                // 4 bytes utf8
+                0xF0...0xF4 => return Error.TBA,
+                0xF5...0xFF => return Error.InvalidUTF8Byte1,
+
+                // Unmatched errors
+                ')',
+                => {
+                    if (self.stackSize() <= 1) return Error.UnmatchedGroup;
+                    _ = try self.finishGroup();
+                    self.consume();
+                    continue :stateLoop .detectToken;
+                },
+                '{',
+                '*',
+                '+',
+                '?',
+                => {
+                    if (self.tokenCount() == 0) return Error.SyntaxError;
+                    if (self.lastToken().* != .group) return Error.SyntaxError;
+                    continue :stateLoop .repeatTokenMatch;
+                },
+
+                '}',
+                => return Error.SyntaxError,
+            }
+        },
+        .literalMatch => {
+            literalLoop: while (true) {
                 if (self.finished()) {
-                    self.state = .end;
-                    continue :stateLoop;
+                    try self.punchLiteral();
+                    continue :stateLoop .end;
                 }
                 switch (self.peek()) {
-                    '$',
-                    '^',
-                    '.',
-                    '(',
-                    => {
-                        _ = try self.startNextGroup();
-                        self.consume();
-                        continue :stateLoop;
-                    },
-                    '[',
-                    '|',
-                    '\\',
-                    => return Error.TBA,
-
-                    // Non-printables
-                    0x00...0x1F,
-                    // [ !"#]
-                    0x20...0x23,
-                    // [%&']
-                    0x25...0x27,
-                    // [,-]
-                    0x2C...0x2D,
-                    // 0x2F
-                    '/',
-                    // 0x30 - 0x39
-                    '0'...'9',
-                    // [:;<=>]
-                    0x3A...0x3E,
-                    // 0x40
-                    '@',
-                    // 0x41 - 0x5A
-                    'A'...'Z',
-                    // 0x5F
-                    '_',
-                    // 0x60
-                    '`',
-                    // 0x61 - 7A
-                    'a'...'z',
-                    // 0x7E
-                    '~',
-                    0x7F,
-                    => {
-                        self.state = .literalMatch;
-                        self.startIdx = self.i;
-                        self.consume();
-                        continue :stateLoop;
-                    },
-
-                    // invalid continuation in utf8 in this state
-                    0x80...0xBF => return Error.Bad2ByteUTF8Start,
-                    // Those violate shortest encoding rules for 2 bytes
-                    0xC0...0xC1 => return Error.TBA,
-                    // 2 bytes utf8
-                    0xC2...0xDF => return Error.TBA,
-                    // 3 bytes utf8
-                    0xE0...0xEF => return Error.TBA,
-                    // 4 bytes utf8
-                    0xF0...0xF4 => return Error.TBA,
-                    0xF5...0xFF => return Error.InvalidUTF8Byte1,
-
-                    // Unmatched errors
-                    ')',
-                    => {
-                        if (self.stackSize() <= 1) return Error.UnmatchedGroup;
-                        _ = try self.finishGroup();
-                        self.consume();
-                        continue :stateLoop;
-                    },
-                    ']',
+                    // ranges
                     '{',
-                    '}',
+                    '?',
                     '*',
                     '+',
-                    '?',
+                    => {
+                        try self.punchLiteralSeqAndTail();
+                        continue :stateLoop .repeatTokenMatch;
+                    },
+
+                    // Unmatched errors
+                    '}',
+                    ']',
                     => return Error.SyntaxError,
-                }
-            },
-            .literalMatch => {
-                literalLoop: while (true) {
-                    if (self.finished()) {
+
+                    // TODO: decide what to do with utf8 in middle of literal
+                    0x80...0xFF => return Error.TBA,
+                    // TODO: decide what to do with scaping in middle of literal
+                    '\\' => return Error.TBA,
+
+                    '$',
+                    '(',
+                    ')',
+                    '[',
+                    '^',
+                    '|',
+                    => {
                         try self.punchLiteral();
-                        self.state = .end;
-                        continue :stateLoop;
-                    }
-                    switch (self.peek()) {
-                        // ranges
-                        '{',
-                        '?',
-                        '*',
-                        '+',
-                        => {
-                            try self.punchLiteralSeqAndTail();
-                            self.state = .repeatTokenMatch;
-                            continue :stateLoop;
-                        },
+                        continue :stateLoop .detectToken;
+                    },
 
-                        // Unmatched errors
-                        '}',
-                        ']',
-                        => return Error.SyntaxError,
-
-                        // TODO: decide what to do with utf8 in middle of literal
-                        0x80...0xFF => return Error.TBA,
-                        // TODO: decide what to do with scaping in middle of literal
-                        '\\' => return Error.TBA,
-
-                        '$',
-                        '(',
-                        ')',
-                        '[',
-                        '^',
-                        '|',
-                        => {
-                            try self.punchLiteral();
-                            self.state = .detectToken;
-                            continue :stateLoop;
-                        },
-
-                        else => {
-                            self.consume();
-                            continue :literalLoop;
-                        },
-                    }
-                }
-            },
-            .repeatTokenMatch => {
-                switch (self.peek()) {
-                    '{' => {
-                        const range = try self.allocator.create(Range);
-                        try range.parseRange(self);
-                        try self.makeRepeatable(range);
-                        self.state = .postRepeat;
-                        continue :stateLoop;
-                    },
-                    '?' => {
-                        try self.makeRepeatable(Range.Optional);
-                        self.consume();
-                        self.state = .postRepeat;
-                        continue :stateLoop;
-                    },
-                    '*' => {
-                        try self.makeRepeatable(Range.Any);
-                        self.consume();
-                        self.state = .postRepeat;
-                        continue :stateLoop;
-                    },
-                    '+' => {
-                        try self.makeRepeatable(Range.OneOrMore);
-                        self.consume();
-                        self.state = .postRepeat;
-                        continue :stateLoop;
-                    },
-                    else => return Error.SyntaxError,
-                }
-            },
-            .postRepeat => {
-                switch (self.peek()) {
-                    '?' => {
-                        const last = self.lastTokenAs(.repeatable);
-                        last.repeatable.flavour = .lazy;
-                        self.consume();
-                        continue :stateLoop;
-                    },
-                    '{',
-                    '*',
-                    => return Error.NestedQuantifier,
-                    // Possessive quantifier
-                    '+' => return Error.TBA,
                     else => {
-                        self.state = .detectToken;
-                        continue :stateLoop;
+                        self.consume();
+                        continue :literalLoop;
                     },
                 }
-            },
-            .end => {
-                if (!self.finished()) return Error.PrematureEnd;
-                if (self.stackSize() > 1) return Error.UnmatchedGroup;
-                return try self.finishGroup();
-            },
-        }
-        return Error.UnhandledToken;
+            }
+        },
+        .repeatTokenMatch => {
+            switch (self.peek()) {
+                '{' => {
+                    const range = try self.allocator.create(Range);
+                    try range.parseRange(self);
+                    try self.makeRepeatable(range);
+                    continue :stateLoop .postRepeat;
+                },
+                '?' => {
+                    try self.makeRepeatable(Range.Optional);
+                    self.consume();
+                    continue :stateLoop .postRepeat;
+                },
+                '*' => {
+                    try self.makeRepeatable(Range.Any);
+                    self.consume();
+                    continue :stateLoop .postRepeat;
+                },
+                '+' => {
+                    try self.makeRepeatable(Range.OneOrMore);
+                    self.consume();
+                    continue :stateLoop .postRepeat;
+                },
+                else => return Error.SyntaxError,
+            }
+        },
+        .postRepeat => {
+            if (self.finished()) continue :stateLoop .end;
+
+            switch (self.peek()) {
+                '?' => {
+                    const last = self.lastTokenAs(.repeatable);
+                    last.repeatable.flavour = .lazy;
+                    self.consume();
+                    continue :stateLoop .detectToken;
+                },
+                '{',
+                '*',
+                => return Error.NestedQuantifier,
+                // Possessive quantifier
+                '+' => return Error.TBA,
+                else => continue :stateLoop .detectToken,
+            }
+        },
+        .end => {
+            if (!self.finished()) return Error.PrematureEnd;
+            if (self.stackSize() > 1) return Error.UnmatchedGroup;
+            return try self.finishGroup();
+        },
     }
-    unreachable;
+    return Error.UnhandledToken;
 }
 
 test "test collect" {
@@ -451,12 +448,14 @@ test "collect groups" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const pattern: []const u8 = "(a(bc)()c)";
+    const pattern: []const u8 = "(a(bc)()c)(a){1,2}";
     var scanner: Scanner = undefined;
     var diag: Diagnostics = undefined;
     defer diag.deinit();
     try scanner.initWithDiag(allocator, &diag, pattern);
-    const group0T = try scanner.collect();
+    const group0T = scanner.collectWithReport() catch |e| {
+        try scanner.diagnostics.?.printRaise(e);
+    };
 
     try tt.expectEqualDeep(*const Token, &.{
         .group = &.{
@@ -483,17 +482,29 @@ test "collect groups" {
                         },
                     },
                 },
+                &.{
+                    .repeatable = asPtrConCast(Repeatable, &.{
+                        .range = &.{ .min = 1, .max = 2 },
+                        .token = &.{
+                            .group = &.{
+                                .n = 4,
+                                .tokens = &.{&.{ .literal = "a" }},
+                            },
+                        },
+                        .flavour = .greedy,
+                    }),
+                },
             },
         },
     }, group0T);
 }
 
 pub inline fn makeRepeatable(self: *Scanner, range: *const Range) Allocator.Error!void {
-    const lastToken = self.popToken();
+    const last = self.popToken();
     const repeatable = try self.allocator.create(Repeatable);
     repeatable.* = .{
         .range = range,
-        .token = lastToken,
+        .token = last,
         .flavour = .greedy,
     };
 
@@ -578,9 +589,13 @@ pub inline fn finishGroup(self: *Scanner) Allocator.Error!*const Token {
     return try openGroup.finishGroup(self);
 }
 
-pub inline fn lastTokenAs(self: *Scanner, comptime tokenTag: TokenTag) *const Token {
+pub inline fn lastToken(self: *Scanner) *const Token {
     assert(self.tokenCount() > 0);
-    const token = self.tokens.items[self.currToken()];
+    return self.tokens.items[self.currTokenIdx()];
+}
+
+pub inline fn lastTokenAs(self: *Scanner, comptime tokenTag: TokenTag) *const Token {
+    const token = self.lastToken();
     // Should this be an actual error check?
     assert(token.* == tokenTag);
     return token;
@@ -601,18 +616,17 @@ pub inline fn punchGroup(self: *Scanner) Allocator.Error!*Group {
     return group;
 }
 
-pub inline fn startNextGroup(self: *Scanner) Error!*OpenGroup {
-    return try self.startGroup(self.currGroup + 1);
+pub inline fn startNextGroup(self: *Scanner) Error!void {
+    try self.startGroup(self.currGroup + 1);
 }
 
-pub inline fn startGroup(self: *Scanner, n: u16) Error!*OpenGroup {
+pub inline fn startGroup(self: *Scanner, n: u16) Error!void {
     const openGroup = try self.allocator.create(OpenGroup);
     openGroup.* = .{
         .n = n,
         .start = self.tokenCount(),
     };
     try self.stackGroup(openGroup);
-    return openGroup;
 }
 
 pub inline fn stackGroup(self: *Scanner, openGroup: *OpenGroup) Allocator.Error!void {
@@ -625,7 +639,7 @@ pub inline fn appendToken(self: *Scanner, token: *const Token) Allocator.Error!v
 }
 
 pub inline fn popToken(self: *Scanner) *const Token {
-    assert(self.currToken() > 0);
+    assert(self.currTokenIdx() > 0);
     return self.tokens.pop().?;
 }
 
@@ -637,7 +651,7 @@ pub inline fn tokenCount(self: *const Scanner) usize {
     return self.tokens.items.len;
 }
 
-pub inline fn currToken(self: *const Scanner) usize {
+pub inline fn currTokenIdx(self: *const Scanner) usize {
     const tokensLen = self.tokenCount();
     assert(tokensLen > 0);
     return tokensLen - 1;
@@ -654,6 +668,10 @@ pub inline fn hasNext(self: *const Scanner) bool {
 pub inline fn consume(self: *Scanner) void {
     assert(self.hasNext());
     self.i += 1;
+}
+
+pub inline fn tagStart(self: *Scanner) void {
+    self.startIdx = self.i;
 }
 
 pub inline fn peekPrev(self: *const Scanner) u8 {
@@ -711,8 +729,8 @@ pub fn report(self: *Scanner, e: Error, comptime message: []const u8) Error!nore
         "{s} - {s}<{c}>{s} - " ++ message,
         .{
             @errorName(e),
-            if (self.i == 0) "" else self.pattern[0..self.i],
-            if (self.i == 0 or self.finished()) 0x00 else self.pattern[self.i],
+            if (self.i == 0) "" else self.slice(),
+            if (self.i == 0 or self.finished()) 0x00 else self.peek(),
             if (self.i + 1 >= self.pattern.len) "" else self.pattern[self.i + 1 ..],
         },
     );
