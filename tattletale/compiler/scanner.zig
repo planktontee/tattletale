@@ -111,7 +111,6 @@ pub const RepeatableFlavour = enum {
 };
 
 pub const Token = union(enum) {
-    group0: []const *const Token,
     group: *const Group,
     literal: []const u8,
     repeatable: *Repeatable,
@@ -355,7 +354,10 @@ pub fn collect(self: *@This()) Error!*const Token {
         .end => {
             if (!self.finished()) return Error.PrematureEnd;
             if (self.stackSize() > 1) return Error.UnmatchedGroup;
-            return try self.finishGroup();
+            const group0 = try self.finishGroup();
+            assert(self.tokenCount() == 1);
+            assert(self.stackSize() == 0);
+            return group0;
         },
     }
     return Error.UnhandledToken;
