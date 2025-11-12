@@ -9,3 +9,5 @@ pub const RgxNode = Compiler.RgxNode;
 pub const Visitor = Compiler.Visitor;
 pub const LinkedList = Compiler.LinkedList;
 pub const LiteralRgxNode = Compiler.LiteralRgxNode;
+pub const RepeatableRgxNode = Compiler.RepeatableRgxNode;
+pub const Cursor = Compiler.Cursor;

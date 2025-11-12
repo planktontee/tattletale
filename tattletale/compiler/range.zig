@@ -46,6 +46,10 @@ pub const Optional: *const Range = &.{
     .max = 1,
 };
 
+pub fn in(self: *const Range, value: usize) bool {
+    return value >= self.min and value <= self.max;
+}
+
 pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
     var digitsIdx: usize = undefined;
 
