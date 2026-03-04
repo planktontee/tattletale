@@ -42,27 +42,27 @@ pub const Diagnostics = struct {
     }
 };
 
+pub const TokenTag = @typeInfo(RgxToken).@"union".tag_type.?;
+
+pattern: []const u8,
+i: usize = 0,
+diagnostics: ?*Diagnostics = null,
+allocator: Allocator,
+
+tokens: []*const RgxToken,
+tokenI: usize = 0,
+
+groupCount: u16 = 0,
+finishedGroups: u16 = 0,
+
+startIdx: usize = 0,
+
 pub fn init(
     self: *@This(),
     allocator: Allocator,
     pattern: []const u8,
 ) !void {
     try self.initAll(allocator, null, pattern);
-}
-
-pub fn initAll(
-    self: *@This(),
-    allocator: Allocator,
-    diagnostics: ?*Diagnostics,
-    pattern: []const u8,
-) !void {
-    self.* = .{
-        .allocator = allocator,
-        .pattern = pattern,
-        .tokens = try .initCapacity(allocator, 8),
-        .stack = try .initCapacity(allocator, 8),
-        .diagnostics = diagnostics,
-    };
 }
 
 pub fn initWithDiag(
@@ -79,55 +79,74 @@ pub fn initWithDiag(
     try self.initAll(allocator, diagnostics, pattern);
 }
 
-pub const Group = struct {
-    n: u16,
-    tokens: []const *const Token,
-};
+fn initAll(
+    self: *@This(),
+    allocator: Allocator,
+    diagnostics: ?*Diagnostics,
+    pattern: []const u8,
+) !void {
+    self.* = .{
+        .allocator = allocator,
+        .pattern = pattern,
+        .tokens = try allocator.alloc(*const RgxToken, pattern.len + 2),
+        .diagnostics = diagnostics,
+    };
+}
 
-pub const OpenGroup = struct {
-    n: u16,
-    start: usize,
+pub const Quantifier = struct {
+    range: *const Range,
+    flavour: QuantifierType,
 
-    pub fn finishGroup(self: *OpenGroup, scanner: *Scanner) Allocator.Error!*const Token {
-        const tokens = try scanner.ownedTokenSliceFrom(self.start);
-        const group = try scanner.punchGroup();
-        group.* = .{
-            .n = self.n,
-            .tokens = tokens,
-        };
-        return scanner.lastTokenAs(.group);
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        if (self.range == Range.Any) {
+            try w.writeAll("any");
+        } else if (self.range == Range.OneOrMore) {
+            try w.writeAll("oneOrMore");
+        } else if (self.range == Range.Optional) {
+            try w.writeAll("optional");
+            return;
+        } else {
+            try w.print("{d}..{d}", .{ self.range.min, self.range.max });
+        }
+        try w.print(" {s}", .{@tagName(self.flavour)});
     }
 };
 
-pub const Repeatable = struct {
-    range: *const Range,
-    token: *const Token,
-    flavour: RepeatableFlavour,
-};
-
-pub const RepeatableFlavour = enum {
+pub const QuantifierType = enum {
     greedy,
     lazy,
 };
 
-pub const Token = union(enum) {
-    group: *const Group,
+pub const RgxToken = union(enum) {
+    group: u16,
+    groupEnd,
+
     literal: []const u8,
-    repeatable: *Repeatable,
+
+    quantifier: *Quantifier,
+
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        switch (self.*) {
+            inline else => {
+                try w.writeAll(@tagName(self.*));
+            },
+        }
+
+        switch (self.*) {
+            .group => |n| try w.print(" {d}", .{n}),
+            .literal => |lit| try w.print(" '{s}'", .{lit}),
+            .groupEnd,
+            => {},
+            inline else => |t| try w.print(" {f}", .{t}),
+        }
+    }
 };
-
-pub const TokenTag = @typeInfo(Token).@"union".tag_type.?;
-
-pattern: []const u8,
-i: usize = 0,
-diagnostics: ?*Diagnostics = null,
-allocator: Allocator,
-
-tokens: std.ArrayListUnmanaged(*const Token),
-stack: std.ArrayListUnmanaged(*OpenGroup),
-currGroup: u16 = 0,
-
-startIdx: usize = 0,
 
 pub const Error = error{
     TBA,
@@ -160,20 +179,19 @@ const State = union(enum) {
     end,
 };
 
-pub fn collectWithReport(self: *@This()) Error!*const Token {
-    const token = self.collect() catch |e| {
-        try self.report(e, "Failed IR");
+pub fn collectWithReport(self: *@This()) Error![]*const RgxToken {
+    return self.collect() catch |e| {
+        try self.report(e, "Scan error: ");
     };
-    return token;
 }
 
-pub fn collect(self: *@This()) Error!*const Token {
+pub fn collect(self: *@This()) Error![]*const RgxToken {
     stateLoop: switch (State.init) {
         .init => {
             if (self.finished()) return Error.EmptyPattern;
-            assert(self.stackSize() == 0);
+            assert(self.groupCount == 0);
 
-            _ = try self.startGroup(0);
+            try self.startNextGroup();
             continue :stateLoop .detectToken;
         },
         .detectToken => {
@@ -243,8 +261,8 @@ pub fn collect(self: *@This()) Error!*const Token {
                 // Unmatched errors
                 ')',
                 => {
-                    if (self.stackSize() <= 1) return Error.UnmatchedGroup;
-                    _ = try self.finishGroup();
+                    if (!self.hasOpenGroups()) return Error.UnmatchedGroup;
+                    try self.finishGroup();
                     self.consume();
                     continue :stateLoop .detectToken;
                 },
@@ -253,8 +271,7 @@ pub fn collect(self: *@This()) Error!*const Token {
                 '+',
                 '?',
                 => {
-                    if (self.tokenCount() == 0) return Error.SyntaxError;
-                    if (self.lastToken().* != .group) return Error.SyntaxError;
+                    if (!self.lastIsRepeatable()) return Error.SyntaxError;
                     continue :stateLoop .repeatTokenMatch;
                 },
 
@@ -312,21 +329,21 @@ pub fn collect(self: *@This()) Error!*const Token {
                 '{' => {
                     const range = try self.allocator.create(Range);
                     try range.parseRange(self);
-                    try self.makeRepeatable(range);
+                    try self.makeQuantifier(range);
                     continue :stateLoop .postRepeat;
                 },
                 '?' => {
-                    try self.makeRepeatable(Range.Optional);
+                    try self.makeQuantifier(Range.Optional);
                     self.consume();
                     continue :stateLoop .postRepeat;
                 },
                 '*' => {
-                    try self.makeRepeatable(Range.Any);
+                    try self.makeQuantifier(Range.Any);
                     self.consume();
                     continue :stateLoop .postRepeat;
                 },
                 '+' => {
-                    try self.makeRepeatable(Range.OneOrMore);
+                    try self.makeQuantifier(Range.OneOrMore);
                     self.consume();
                     continue :stateLoop .postRepeat;
                 },
@@ -338,8 +355,8 @@ pub fn collect(self: *@This()) Error!*const Token {
 
             switch (self.peek()) {
                 '?' => {
-                    const last = self.lastTokenAs(.repeatable);
-                    last.repeatable.flavour = .lazy;
+                    const last = self.lastTokenAs(.quantifier);
+                    last.quantifier.flavour = .lazy;
                     self.consume();
                     continue :stateLoop .detectToken;
                 },
@@ -353,30 +370,54 @@ pub fn collect(self: *@This()) Error!*const Token {
         },
         .end => {
             if (!self.finished()) return Error.PrematureEnd;
-            if (self.stackSize() > 1) return Error.UnmatchedGroup;
-            const group0 = try self.finishGroup();
-            assert(self.tokenCount() == 1);
-            assert(self.stackSize() == 0);
-            return group0;
+            if (self.hasOpenGroups()) return Error.UnmatchedGroup;
+            try self.finishGroup0();
+            assert(self.finishedGroups == self.groupCount);
+            return self.collectTokens();
         },
     }
     return Error.UnhandledToken;
 }
 
-pub inline fn makeRepeatable(self: *Scanner, range: *const Range) Allocator.Error!void {
-    const last = self.popToken();
-    const repeatable = try self.allocator.create(Repeatable);
-    repeatable.* = .{
-        .range = range,
-        .token = last,
-        .flavour = .greedy,
-    };
-
-    const repeatableT = try self.punchToken(.repeatable);
-    repeatableT.repeatable = repeatable;
+pub fn collectTokens(self: *const Scanner) []*const RgxToken {
+    return self.tokens[0..self.tokenI];
 }
 
-pub inline fn punchLiteralSeqAndTail(self: *Scanner) Allocator.Error!void {
+pub fn makeQuantifier(self: *Scanner, range: *const Range) Allocator.Error!void {
+    assert(self.tokenCount() > 1);
+
+    const last = self.tokens[self.tokenI - 1];
+    const quantifier = try self.allocator.create(Quantifier);
+    quantifier.* = .{
+        .range = range,
+        .flavour = .greedy,
+    };
+    const quantifierT = try self.punchToken(.quantifier);
+    quantifierT.quantifier = quantifier;
+
+    switch (last.*) {
+        .groupEnd,
+        .literal,
+        => {},
+        .group,
+        .quantifier,
+        => assert(false),
+    }
+}
+
+pub fn lastIsRepeatable(self: *const Scanner) bool {
+    assert(self.tokenCount() > 0);
+    return switch (self.lastToken().*) {
+        .groupEnd,
+        .literal,
+        => true,
+        .group,
+        .quantifier,
+        => false,
+    };
+}
+
+pub fn punchLiteralSeqAndTail(self: *Scanner) Allocator.Error!void {
     // NOTE: this will not work with utf8
     switch (self.i - self.startIdx) {
         0 => {
@@ -395,9 +436,10 @@ pub inline fn punchLiteralSeqAndTail(self: *Scanner) Allocator.Error!void {
 
     const literal = Literal.of(self.peekPrev());
     try self.appendToken(literal);
+    self.startIdx = self.i;
 }
 
-pub inline fn punchLiteral(self: *Scanner) Allocator.Error!void {
+pub fn punchLiteral(self: *Scanner) Allocator.Error!void {
     switch (self.i - self.startIdx) {
         0 => {
             assert(false);
@@ -411,149 +453,123 @@ pub inline fn punchLiteral(self: *Scanner) Allocator.Error!void {
             sequence.literal = self.slice();
         },
     }
+    self.startIdx = self.i;
 }
 
-pub inline fn slice(self: *const Scanner) []const u8 {
+pub fn slice(self: *const Scanner) []const u8 {
     assert(self.startIdx <= self.i);
     assert(self.i <= self.pattern.len);
 
     return self.pattern[self.startIdx..self.i];
 }
 
-pub inline fn sliceTo(self: *const Scanner, end: usize) []const u8 {
+pub fn sliceTo(self: *const Scanner, end: usize) []const u8 {
     assert(self.startIdx <= end);
     assert(end <= self.pattern.len);
 
     return self.pattern[self.startIdx..end];
 }
 
-pub inline fn sliceFrom(self: *const Scanner, start: usize) []const u8 {
+pub fn sliceFrom(self: *const Scanner, start: usize) []const u8 {
     assert(start < self.pattern.len);
     assert(start < self.i);
     return self.pattern[start..self.i];
 }
 
-pub inline fn ownedTokenSliceFrom(self: *Scanner, start: usize) Allocator.Error![]const *const Token {
-    const newTokenSlice = try self.allocator.alloc(*const Token, self.tokenCount() - start);
-    @memcpy(newTokenSlice, self.tokens.items[start..]);
-    const targetLen = self.tokenCount() - newTokenSlice.len;
-    self.tokens.shrinkRetainingCapacity(targetLen);
-    assert(self.tokenCount() == targetLen);
-    return newTokenSlice;
+pub fn finishGroup(self: *Scanner) Allocator.Error!void {
+    assert(self.finishedGroups < self.groupCount - 1);
+    _ = try self.punchToken(.groupEnd);
+    self.finishedGroups += 1;
 }
 
-pub inline fn popNTokens(self: *Scanner, lastN: usize) void {
-    assert(self.tokenCount() >= lastN);
-    self.tokens.shrinkRetainingCapacity(self.tokenCount() - lastN);
+pub fn finishGroup0(self: *Scanner) Allocator.Error!void {
+    assert(self.finishedGroups == self.groupCount - 1);
+    _ = try self.punchToken(.groupEnd);
+    self.finishedGroups += 1;
 }
 
-pub inline fn finishGroup(self: *Scanner) Allocator.Error!*const Token {
-    assert(self.stack.items.len > 0);
-    const openGroup = self.stack.pop().?;
-    return try openGroup.finishGroup(self);
-}
-
-pub inline fn lastToken(self: *Scanner) *const Token {
+pub fn lastToken(self: *const Scanner) *const RgxToken {
     assert(self.tokenCount() > 0);
-    return self.tokens.items[self.currTokenIdx()];
+    return self.tokens[self.currTokenIdx()];
 }
 
-pub inline fn lastTokenAs(self: *Scanner, comptime tokenTag: TokenTag) *const Token {
+pub fn lastTokenAs(self: *Scanner, comptime tokenTag: TokenTag) *const RgxToken {
     const token = self.lastToken();
     // Should this be an actual error check?
     assert(token.* == tokenTag);
     return token;
 }
 
-pub inline fn punchToken(self: *Scanner, comptime tokenTag: TokenTag) Allocator.Error!*Token {
-    const newToken = try self.allocator.create(Token);
-    newToken.* = @unionInit(Token, @tagName(tokenTag), undefined);
+pub fn punchToken(self: *Scanner, comptime tokenTag: TokenTag) Allocator.Error!*RgxToken {
+    const newToken = try self.createToken(tokenTag);
     try self.appendToken(newToken);
     return newToken;
 }
 
-pub inline fn punchGroup(self: *Scanner) Allocator.Error!*Group {
-    const group = try self.allocator.create(Group);
-    const newToken = try self.allocator.create(Token);
-    newToken.* = .{ .group = group };
-    try self.appendToken(newToken);
-    return group;
+pub fn createToken(self: *Scanner, comptime tokenTag: TokenTag) Allocator.Error!*RgxToken {
+    const newToken = try self.allocator.create(RgxToken);
+    newToken.* = @unionInit(RgxToken, @tagName(tokenTag), undefined);
+    return newToken;
 }
 
-pub inline fn startNextGroup(self: *Scanner) Error!void {
-    try self.startGroup(self.currGroup + 1);
+pub fn startNextGroup(self: *Scanner) Error!void {
+    const groupTk = try self.punchToken(.group);
+    groupTk.group = self.groupCount;
+    self.groupCount += 1;
 }
 
-pub inline fn startGroup(self: *Scanner, n: u16) Error!void {
-    const openGroup = try self.allocator.create(OpenGroup);
-    openGroup.* = .{
-        .n = n,
-        .start = self.tokenCount(),
-    };
-    try self.stackGroup(openGroup);
+pub fn hasOpenGroups(self: *const Scanner) bool {
+    return self.finishedGroups < self.groupCount - 1;
 }
 
-pub inline fn stackGroup(self: *Scanner, openGroup: *OpenGroup) Allocator.Error!void {
-    try self.stack.append(self.allocator, openGroup);
-    self.currGroup = openGroup.n;
+pub fn appendToken(self: *Scanner, token: *const RgxToken) Allocator.Error!void {
+    self.tokens[self.tokenI] = token;
+    self.tokenI += 1;
 }
 
-pub inline fn appendToken(self: *Scanner, token: *const Token) Allocator.Error!void {
-    try self.tokens.append(self.allocator, token);
+pub fn tokenCount(self: *const Scanner) usize {
+    return self.tokenI;
 }
 
-pub inline fn popToken(self: *Scanner) *const Token {
-    assert(self.currTokenIdx() > 0);
-    return self.tokens.pop().?;
-}
-
-pub inline fn stackSize(self: *const Scanner) usize {
-    return self.stack.items.len;
-}
-
-pub inline fn tokenCount(self: *const Scanner) usize {
-    return self.tokens.items.len;
-}
-
-pub inline fn currTokenIdx(self: *const Scanner) usize {
+pub fn currTokenIdx(self: *const Scanner) usize {
     const tokensLen = self.tokenCount();
     assert(tokensLen > 0);
     return tokensLen - 1;
 }
 
-pub inline fn finished(self: *const Scanner) bool {
+pub fn finished(self: *const Scanner) bool {
     return self.i >= self.pattern.len;
 }
 
-pub inline fn hasNext(self: *const Scanner) bool {
+pub fn hasNext(self: *const Scanner) bool {
     return self.i < self.pattern.len;
 }
 
-pub inline fn consume(self: *Scanner) void {
+pub fn consume(self: *Scanner) void {
     assert(self.hasNext());
     self.i += 1;
 }
 
-pub inline fn tagStart(self: *Scanner) void {
+pub fn tagStart(self: *Scanner) void {
     self.startIdx = self.i;
 }
 
-pub inline fn peekPrev(self: *const Scanner) u8 {
+pub fn peekPrev(self: *const Scanner) u8 {
     return self.peekAt(self.i - 1);
 }
 
-pub inline fn peekAt(self: *const Scanner, i: usize) u8 {
+pub fn peekAt(self: *const Scanner, i: usize) u8 {
     assert(i >= 0);
     assert(i < self.pattern.len);
     return self.pattern[i];
 }
 
-pub inline fn peek(self: *const Scanner) u8 {
+pub fn peek(self: *const Scanner) u8 {
     assert(self.hasNext());
     return self.pattern[self.i];
 }
 
-pub inline fn ensureByte(self: *const Scanner) ConsumeError!void {
+pub fn ensureByte(self: *const Scanner) ConsumeError!void {
     if (self.finished()) return Error.UnexpectedEnd;
 }
 
@@ -590,11 +606,11 @@ pub fn report(self: *Scanner, e: Error, comptime message: []const u8) Error!nore
     const buff: []u8 = try diag.makeBuff(4098);
     diag.message = try std.fmt.bufPrint(
         buff,
-        "{s} - {s}<{c}>{s} - " ++ message,
+        message ++ "{s} - {s}<{c}>{s}",
         .{
             @errorName(e),
-            if (self.i == 0) "" else self.slice(),
-            if (self.i == 0 or self.finished()) 0x00 else self.peek(),
+            self.pattern[0..self.i],
+            if (self.finished()) 0x00 else self.peek(),
             if (self.i + 1 >= self.pattern.len) "" else self.pattern[self.i + 1 ..],
         },
     );

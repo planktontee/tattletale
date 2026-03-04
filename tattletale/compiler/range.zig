@@ -155,18 +155,3 @@ pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
         },
     }
 }
-
-pub fn format(self: *const Range, w: *Writer) Writer.Error!void {
-    const buffSize = comptime std.fmt.count("{d}", .{std.math.maxInt(usize)});
-    var startIntBuff: [buffSize]u8 = undefined;
-    var endIntBuff: [buffSize]u8 = undefined;
-
-    const startLen = std.fmt.printInt(&startIntBuff, self.min, 10, .lower, .{});
-    const endLen = std.fmt.printInt(&endIntBuff, self.max, 10, .lower, .{});
-
-    try w.writeAll("{");
-    try w.writeAll(startIntBuff[0..startLen]);
-    try w.writeAll(",");
-    try w.writeAll(endIntBuff[0..endLen]);
-    try w.writeAll("}");
-}

@@ -9,6 +9,11 @@ pub fn build(b: *std.Build) void {
         .{ .target = target, .optimize = optimize },
     ).module("regent");
 
+    const zcasp = b.dependency(
+        "zcasp",
+        .{ .target = target, .optimize = optimize },
+    ).module("zcasp");
+
     const tattletale = b.addModule("tattletale", .{
         .root_source_file = b.path("tattletale.zig"),
         .target = target,
@@ -17,6 +22,10 @@ pub fn build(b: *std.Build) void {
             .{
                 .name = "regent",
                 .module = regent,
+            },
+            .{
+                .name = "zcasp",
+                .module = zcasp,
             },
         },
     });
@@ -43,4 +52,22 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&testArtifact.step);
+
+    const exe = b.addExecutable(.{
+        .name = "tattletale",
+        .root_module = tattletale,
+        .use_llvm = true,
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+
+    run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run_cmd.step);
 }

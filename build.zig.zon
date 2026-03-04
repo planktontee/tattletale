@@ -6,6 +6,10 @@
             .url = "git+https://github.com/planktontee/regent/#0d972c0236ddd4d4dcbedd5fb9be2e7695eed46d",
             .hash = "regent-0.0.1-zgdbwwYxAADDR2IcbQmpcGOiGr5vIU7nTcKThJxwLjJ9",
         },
+        .zcasp = .{
+            .url = "git+https://github.com/planktontee/zcasp/#3a4d5b956cfdd556ab3f5e8726a2348b357cff01",
+            .hash = "zcasp-0.0.1-iIb82Lc3AwBA6fFuRrJDeRVWtlfxpSqRhkhC5WDewl2j",
+        },
     },
     .minimum_zig_version = "0.15.2",
     .paths = .{""},
