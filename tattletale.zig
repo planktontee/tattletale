@@ -5,23 +5,20 @@ pub const Quantifier = Scanner.Quantifier;
 pub const Range = @import("tattletale/compiler/range.zig");
 pub const Literal = @import("tattletale/compiler/literal.zig");
 pub const Compiler = @import("tattletale/compiler.zig");
-pub const RgxNode = Compiler.RgxNode;
-pub const Visitor = Compiler.Visitor;
-pub const LinkedList = Compiler.LinkedList;
-pub const LiteralRgxNode = Compiler.LiteralRgxNode;
-pub const QuantifierRgxNode = Compiler.QuantifierRgxNode;
-pub const Cursor = Compiler.Cursor;
 
 const std = @import("std");
 
 const Returns = enum(u8) {
     ok = 0,
-    stdinReadFailure = 1,
-    stderrWriteFailure = 2,
-    stdoutWriteFailure = 3,
-    failedInit = 4,
-    failedDiagReport = 5,
-    cantStatStdin = 6,
+    matchFailed = 1,
+    stdinReadFailure = 2,
+    stderrWriteFailure = 3,
+    stdoutWriteFailure = 4,
+    failedInit = 5,
+    failedDiagReport = 6,
+    cantStatStdin = 7,
+    failedCompilation = 8,
+    outOfMem = 9,
 };
 
 pub fn main() @typeInfo(Returns).@"enum".tag_type {
@@ -86,15 +83,14 @@ pub fn innerMain() Returns {
             },
         };
         // TODO: stop trimming on non-tty, handle line break properly
-        const line = std.mem.trimEnd(u8, rawline, " \t\n");
+        const trimmedLine = std.mem.trimEnd(u8, rawline, " \t\n");
 
-        outW.writeAll("\x1b[1;32m") catch return .stdoutWriteFailure;
-        outW.writeAll("raw] ") catch return .stdoutWriteFailure;
-        outW.writeAll(line) catch return .stdoutWriteFailure;
-        outW.writeByte('\n') catch return .stdoutWriteFailure;
-        outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
-        outW.flush() catch return .stdoutWriteFailure;
+        const line = scrapAlloc.alloc(u8, trimmedLine.len) catch return .outOfMem;
+        @memcpy(line, trimmedLine);
         inR.toss(rawline.len);
+
+        outW.print("\x1b[1;33mRaw | {s}\n\x1b[0m", .{line}) catch return .stdoutWriteFailure;
+        outW.flush() catch return .stdoutWriteFailure;
 
         scanner.initWithDiag(scrapAlloc, &diag, line) catch return .failedInit;
         const tokens = scanner.collectWithReport() catch {
@@ -105,14 +101,62 @@ pub fn innerMain() Returns {
             continue :loop;
         };
 
-        outW.writeAll("\x1b[0;35m") catch return .stdoutWriteFailure;
+        outW.writeAll("\x1b[0;35mTokens |\n") catch return .stdoutWriteFailure;
         for (tokens, 0..) |token, i| {
-            outW.print("tk]{d}] {f}\n", .{ i, token.* }) catch return .stdoutWriteFailure;
+            outW.print("       | {d}] {f}\n", .{ i, token.* }) catch return .stdoutWriteFailure;
         }
         outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
 
-        // TODO: deinit
+        var compiler: Compiler = .{
+            .allocator = scrapAlloc,
+            .instructions = undefined,
+        };
+        compiler.compile(tokens) catch return .failedCompilation;
+
+        outW.print("{f}", .{compiler}) catch return .stdoutWriteFailure;
+
+        if (isTTY) {
+            outW.writeAll("string> ") catch return .stdoutWriteFailure;
+            outW.flush() catch return .stdoutWriteFailure;
+        }
+
+        const rawInput = inR.peekDelimiterInclusive('\n') catch |e| switch (e) {
+            std.Io.Reader.DelimiterError.EndOfStream => rv: {
+                if (inR.bufferedLen() > 0)
+                    break :rv inR.buffered()
+                else
+                    break :loop;
+            },
+            else => {
+                errW.print("Failed to read stdin with: {s}\n", .{@errorName(e)}) catch
+                    return .stderrWriteFailure;
+                return .stdinReadFailure;
+            },
+        };
+
+        // TODO: stop trimming on non-tty, handle line break properly
+        const trimmedInput = std.mem.trimEnd(u8, rawInput, " \t\n");
+
+        const input = scrapAlloc.alloc(u8, trimmedInput.len) catch return .outOfMem;
+        @memcpy(input, trimmedInput);
+        inR.toss(rawInput.len);
+
+        outW.print("\x1b[1;36mInput | {s}\n\x1b[0m", .{input}) catch return .stdoutWriteFailure;
+        outW.flush() catch return .stdoutWriteFailure;
+
+        compiler.match(input) catch |e| switch (e) {
+            Compiler.MatchError.MatchFailed => {
+                outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
+                return .matchFailed;
+            },
+            else => {
+                outW.print("\x1b[1;31mMatch execution error: {s}\n\x1b[0m", .{@errorName(e)}) catch return .stdoutWriteFailure;
+                return .matchFailed;
+            },
+        };
+        outW.writeAll("\x1b[1;32mMatch succeeded!\n\x1b[0m") catch return .stdoutWriteFailure;
+        outW.flush() catch return .stdoutWriteFailure;
     }
 
     return .ok;

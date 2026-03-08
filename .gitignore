@@ -2,3 +2,4 @@ zig-out
 allgirs
 .zig-cache
 seeksub.zip
+.vscode

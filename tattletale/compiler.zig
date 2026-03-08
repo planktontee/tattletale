@@ -1,312 +1,385 @@
-// const std = @import("std");
-// const Allocator = std.mem.Allocator;
-// const Writer = std.Io.Writer;
-// const Scanner = @import("compiler/scanner.zig");
-// const Literal = @import("compiler/literal.zig");
-// const Quantifier = Scanner.Quantifier;
-// const Token = Scanner.RgxToken;
-// const assert = std.debug.assert;
-//
-// pub fn LLNode(T: type) type {
-//     return struct {
-//         data: T,
-//         next: ?*@This(),
-//     };
-// }
-//
-// pub fn LinkedList(T: type) type {
-//     return struct {
-//         first: ?*LLNode(T) = null,
-//         end: ?*LLNode(T) = null,
-//         size: usize = 0,
-//
-//         pub fn prepend(list: *@This(), allocator: Allocator) !void {
-//             const newNode = try allocator.create(LLNode(T));
-//             newNode.next = list.first;
-//             list.first = newNode;
-//             list.size += 1;
-//         }
-//
-//         pub fn pop(list: *@This(), allocator: Allocator) ?T {
-//             if (list.first == null) return null;
-//             const node = list.last.?;
-//             defer allocator.destroy(node);
-//
-//             list.last = node.next;
-//             return node.data;
-//         }
-//     };
-// }
-//
-// pub const State = union(enum) {
-//     finished: usize,
-//     partial: usize,
-//     failed,
-// };
-//
-// pub const RgxNodeEnum = @typeInfo(RgxNode).@"union".tag_type.?;
-//
-// pub const RgxNode = union(enum) {
-//     group,
-//     literal: *LiteralRgxNode,
-//     quantifier: *QuantifierRgxNode,
-//
-//     pub fn next(self: *@This(), cursor: *Cursor) State {
-//         switch (self.*) {
-//             .literal,
-//             => |lit| return lit.next(cursor),
-//             // TODO: register to potentitial backtrack
-//             .quantifier,
-//             => |reap| return reap.next(cursor),
-//             .group,
-//             => assert(false),
-//         }
-//         unreachable;
-//     }
-// };
-//
-// pub const SavedState = struct {
-//     i: usize,
-//     start: usize,
-//     end: usize,
-// };
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Scanner = @import("compiler/scanner.zig");
+const RgxToken = Scanner.RgxToken;
+const Quantifier = Scanner.Quantifier;
 
-// pub const Match = struct {
-//     nodes: []*RgxNode,
-//     allocator: Allocator,
-//
-//     state: std.AutoHashMapUnmanaged(
-//         *RgxNode,
-//         *std.ArrayListUnmanaged(*const SavedState),
-//     ),
-//
-//     pub const _State = enum {
-//         init,
-//         matching,
-//         done,
-//     };
-//
-//     pub fn init(allocator: Allocator, nodes: []*RgxNode) @This() {
-//         return .{
-//             .allocator = allocator,
-//             .state = .empty,
-//             .nodes = nodes,
-//         };
-//     }
-//
-//     // NOTE:
-//     // Sketch:
-//     // - move forward by nodes
-//     // - group0 matches entire list
-//     // - match sequentially the nodes
-//     // - on failure, ask all matched nodes if they can rollback
-//     // - every node that can't be rolled back, needs resetting
-//     // - nodes that can be rolled back, need an internal cache state to roll back to
-//     // - rollback needs to also rollback cursor
-//     // - if all nodes are resetted, we restore cursor and +1 and try again
-//     //
-//     // TODO:
-//     // Stricter state handling
-//     // - failures will require resets on handlers
-//     // - failures dont move cursor
-//     // - partials are not exposes, are used as:wq internal states
-//     //
-//     // TODO:
-//     //
-//
-//     pub fn next(self: *@This(), cursor: *Cursor) State {
-//         var i: usize = 0;
-//         var state: _State = .init;
-//         var start: usize = 0;
-//         while (true) {
-//             if (cursor.finished()) {
-//                 if (state != .done) {
-//                     // TODO: backtrack
-//                     assert(false);
-//                 } else {
-//                     const last = self.state.get(self.nodes[self.nodes.len - 1]).?;
-//                     return .{ .finished = last.getLast().end };
-//                 }
-//             }
-//
-//             const node = self.nodes[i];
-//             const result = node.next(cursor);
-//             switch (result) {
-//                 .finished => i += 1,
-//                 .partial => |end| {
-//                     switch (node.*) {
-//                         .quantifier => |rp| {
-//                             const list = if (self.state.get(node)) |list| list else rv: {
-//                                 const list = try self.allocator.create(std.ArrayListUnmanaged(*const SavedState));
-//                                 list.* = .empty;
-//                                 break :rv list;
-//                             };
-//                             const ss = try self.allocator.create(SavedState);
-//                             ss.* = .{
-//                                 .i = rp.count,
-//                                 .start = start,
-//                                 .end = end,
-//                             };
-//                             try list.append(self.allocator, ss);
-//                             start = end;
-//                         },
-//                         .group, .literal => assert(false),
-//                     }
-//                 },
-//                 .failed => {
-//                     switch (state) {
-//                         .init => cursor.consume(),
-//                         .matching => {
-//                             // TODO: backtrack
-//                             assert(false);
-//                         },
-//                     }
-//                 },
-//             }
-//         }
-//     }
-// };
+pub const GroupInstruction = struct {
+    n: u16,
+    start: usize,
+    end: usize,
 
-// pub const QuantifierRgxNode = struct {
-//     count: usize = 0,
-//     quantifier: *const Quantifier,
-//     node: RgxNode,
-//
-//     pub fn init(quantifier: *const Quantifier, node: RgxNode) @This() {
-//         return .{
-//             .count = 0,
-//             .quantifier = quantifier,
-//             .node = node,
-//         };
-//     }
-//
-//     // TODO: add backtrack
-//
-//     // TODO: internalize state
-//     pub fn next(self: *@This(), cursor: *Cursor) State {
-//         switch (self.quantifier.flavour) {
-//             .greedy => {
-//                 const range = self.quantifier.range;
-//                 assert(self.count < range.max);
-//
-//                 const start = cursor.i;
-//                 switch (self.node.next(cursor)) {
-//                     .finished => |end| {
-//                         self.count += 1;
-//                         if (self.count == range.max) {
-//                             return .{ .finished = end };
-//                         }
-//                         return .{ .partial = end };
-//                     },
-//                     .failed => {
-//                         assert(start == cursor.i);
-//                         if (range.in(self.count)) return .{
-//                             .finished = cursor.i,
-//                         };
-//                         return .failed;
-//                     },
-//                     .partial => assert(false),
-//                 }
-//             },
-//             .lazy => @panic("lazy not supported yet"),
-//         }
-//         unreachable;
-//     }
-// };
-//
-// pub const LiteralRgxNode = struct {
-//     target: []const u8,
-//
-//     pub fn init(target: []const u8) @This() {
-//         return .{
-//             .target = target,
-//         };
-//     }
-//
-//     pub fn next(self: *@This(), cursor: *Cursor) State {
-//         // Short circuit
-//         if (self.target.len > cursor.reminder()) return .failed;
-//
-//         for (self.target, cursor.peekN(self.target.len)) |c, tc| {
-//             if (c != tc) return .failed;
-//         }
-//
-//         cursor.consumeN(self.target.len);
-//         return .{ .finished = cursor.i };
-//     }
-// };
-//
-// pub const Cursor = struct {
-//     data: []const u8,
-//     i: usize = 0,
-//
-//     pub fn setCursors(self: *@This(), i: usize) void {
-//         assert(i <= self.data.len);
-//         self.i = i;
-//     }
-//
-//     pub inline fn peek(self: *const @This()) u8 {
-//         assert(self.i < self.data.len);
-//         return self.data[self.i];
-//     }
-//
-//     pub inline fn peekN(self: *const @This(), len: usize) []const u8 {
-//         assert(self.i + len <= self.data.len);
-//         return self.data[self.i .. self.i + len];
-//     }
-//
-//     pub inline fn consume(self: *@This()) void {
-//         self.i += 1;
-//     }
-//
-//     pub inline fn consumeN(self: *@This(), len: usize) void {
-//         self.i += len;
-//     }
-//
-//     pub inline fn finished(self: *const @This()) bool {
-//         return self.i == self.data.len;
-//     }
-//
-//     pub inline fn reminder(self: *const @This()) usize {
-//         return self.data.len - self.i;
-//     }
-//
-//     pub inline fn reminderFrom(self: *const @This(), i: usize) usize {
-//         assert(self.data.len >= i);
-//         return self.data.len - i;
-//     }
-//
-//     pub inline fn sliceFrom(self: *const @This(), start: usize) []const u8 {
-//         assert(start < self.i);
-//         return self.data[start..self.i];
-//     }
-//
-//     pub inline fn slice(self: *const @This(), start: usize, end: usize) []const u8 {
-//         assert(end > start);
-//         assert(end <= self.data.len);
-//         return self.data[start..end];
-//     }
-// };
-//
-// pub fn compileWithDebug(_: *Compiler, allocator: Allocator, pattern: []const u8) !RgxNode {
-//     var scanner: Scanner = undefined;
-//     var diagnostics: Scanner.Diagnostics = undefined;
-//     try scanner.initWithDiag(allocator, &diagnostics, pattern);
-//
-//     const root = try scanner.collectWithReport();
-//     var nodeOpt: ?*const Scanner.RgxToken = root;
-//     while (nodeOpt) |node| {
-//         switch (node.*) {
-//             .group,
-//             .quantifier,
-//             => {},
-//             .literal,
-//             => {},
-//         }
-//         nodeOpt = null;
-//     }
-//
-//     return;
-// }
-//
-// const Compiler = @This();
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("{d} ins[{d}..{d}]", .{ self.n, self.start, self.end });
+    }
+};
+
+pub const RepeatGroupInstruction = struct {
+    n: u16,
+    start: usize,
+    end: usize,
+    quantifier: *const Quantifier,
+
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("{d} ins[{d}..{d}] {f}", .{ self.n, self.start, self.end, self.quantifier.* });
+    }
+};
+
+pub const RepeatLiteral = struct {
+    literal: []const u8,
+    quantifier: *const Quantifier,
+
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("'{s}' {f}", .{ self.literal, self.quantifier.* });
+    }
+};
+
+pub const Instruction = union(enum) {
+    literal: []const u8,
+    group: *GroupInstruction,
+
+    repeatLiteral: *RepeatLiteral,
+    repeatGroup: *RepeatGroupInstruction,
+
+    pub fn format(self: *const @This(), w: *std.Io.Writer) !void {
+        try switch (self.*) {
+            .literal => |value| w.print("'{s}'", .{value}),
+            inline else => |value| w.print("{f}", .{value}),
+        };
+    }
+};
+
+instructions: []Instruction = undefined,
+allocator: Allocator = undefined,
+stack: std.ArrayList(State) = undefined,
+
+const GroupFrame = struct {
+    n: u16,
+    instructionIdxStart: usize,
+};
+
+pub fn compile(self: *@This(), tokens: []*const RgxToken) !void {
+    var instructions = try std.ArrayList(Instruction).initCapacity(self.allocator, 10);
+    var groupFrames = try std.ArrayList(usize).initCapacity(self.allocator, 10);
+
+    var i: usize = 0;
+    var lastInstruction: ?*Instruction = null;
+
+    while (i < tokens.len) : (i += 1) {
+        switch (tokens[i].*) {
+            .group => |n| {
+                const groupInst = try self.allocator.create(GroupInstruction);
+                groupInst.* = .{
+                    .n = n,
+                    .start = undefined,
+                    .end = undefined,
+                };
+
+                try instructions.append(self.allocator, .{ .group = groupInst });
+                try groupFrames.append(self.allocator, instructions.items.len - 1);
+                lastInstruction = &instructions.items[instructions.items.len - 1];
+            },
+            .groupEnd => {
+                const targetGroupIdx = groupFrames.pop().?;
+                const targetGroupInst: *Instruction = @ptrCast(instructions.items.ptr + targetGroupIdx);
+                const lastInst: *Instruction = @ptrCast(instructions.items.ptr + instructions.items.len - 1);
+
+                switch (lastInst.*) {
+                    .literal,
+                    .repeatLiteral,
+                    => {
+                        switch (targetGroupInst.*) {
+                            .literal,
+                            .repeatLiteral,
+                            => unreachable,
+                            inline else => |targetGroup| {
+                                targetGroup.start = targetGroupIdx + 1;
+                                targetGroup.end = instructions.items.len;
+                            },
+                        }
+                    },
+                    inline else => |lastInstGroup| {
+                        switch (targetGroupInst.*) {
+                            .literal,
+                            .repeatLiteral,
+                            => unreachable,
+                            inline else => |targetGroup| {
+                                if (lastInstGroup.n == targetGroup.n) {
+                                    targetGroup.start = targetGroupIdx;
+                                    targetGroup.end = targetGroupIdx + 1;
+                                } else {
+                                    targetGroup.start = targetGroupIdx + 1;
+                                    targetGroup.end = instructions.items.len;
+                                }
+                            },
+                        }
+                    },
+                }
+
+                lastInstruction = targetGroupInst;
+            },
+            .literal => |value| {
+                try instructions.append(self.allocator, .{ .literal = value });
+                lastInstruction = &instructions.items[instructions.items.len - 1];
+            },
+            .quantifier => |quantifier| {
+                switch (lastInstruction.?.*) {
+                    .group => |groupIns| {
+                        const repeatGroupInstruction = try self.allocator.create(RepeatGroupInstruction);
+                        repeatGroupInstruction.* = .{
+                            .n = groupIns.n,
+                            .start = groupIns.start,
+                            .end = groupIns.end,
+                            .quantifier = quantifier,
+                        };
+                        lastInstruction.?.* = .{
+                            .repeatGroup = repeatGroupInstruction,
+                        };
+                    },
+                    .literal => |literalIns| {
+                        const repeatLiteral = try self.allocator.create(RepeatLiteral);
+                        repeatLiteral.* = .{
+                            .literal = literalIns,
+                            .quantifier = quantifier,
+                        };
+                        lastInstruction.?.* = .{
+                            .repeatLiteral = repeatLiteral,
+                        };
+                    },
+                    .repeatGroup,
+                    .repeatLiteral,
+                    => unreachable,
+                }
+            },
+        }
+    }
+
+    assert(groupFrames.items.len == 0);
+    self.instructions = try instructions.toOwnedSlice(self.allocator);
+}
+
+const State = struct {
+    pc: usize,
+    cursor: usize,
+    matchCount: usize,
+};
+
+const MatchState = enum {
+    // Matching
+    matching,
+    backtracking,
+
+    // Decision
+    queryStack,
+
+    // Conclusive
+    failed,
+    succeeded,
+};
+
+pub const MatchError = error{
+    MatchFailed,
+    TBA,
+} || std.mem.Allocator.Error;
+
+pub fn match(
+    self: *@This(),
+    text: []const u8,
+) MatchError!void {
+    self.stack = try .initCapacity(self.allocator, 10);
+
+    var state: State = .{
+        .pc = 0,
+        .cursor = 0,
+        .matchCount = 0,
+    };
+
+    stateLoop: switch (@as(MatchState, .matching)) {
+        .matching,
+        => {
+            if (state.pc >= self.instructions.len)
+                continue :stateLoop .succeeded;
+
+            switch (self.instructions[state.pc]) {
+                .group,
+                => |groupInst| {
+                    // TODO: save match
+                    if (groupInst.n != 0) return MatchError.TBA;
+
+                    state.pc += 1;
+                    continue :stateLoop .matching;
+                },
+                .literal,
+                => |literal| {
+                    if (self.matchLiteral(text[state.cursor..], literal)) {
+                        state.cursor += literal.len;
+                        state.pc += 1;
+                        continue :stateLoop .matching;
+                    } else continue :stateLoop .queryStack;
+                    unreachable;
+                },
+                .repeatGroup,
+                => {
+                    // Save only the last picked
+                    return MatchError.TBA;
+                },
+                .repeatLiteral,
+                => |repeatLiteral| {
+                    state.matchCount = 0;
+                    const range = repeatLiteral.quantifier.range;
+                    const literal = repeatLiteral.literal;
+
+                    switch (repeatLiteral.quantifier.flavour) {
+                        .greedy,
+                        => {
+                            greedyLoop: while (state.matchCount < range.max) : (state.matchCount += 1) {
+                                if (self.matchLiteral(text[state.cursor..], literal)) {
+                                    state.cursor += literal.len;
+
+                                    // Only add to stack retriable states
+                                    // matchCount is one behind
+                                    if (state.matchCount + 1 >= range.min)
+                                        try self.stack.append(self.allocator, .{
+                                            .cursor = state.cursor,
+                                            .pc = state.pc,
+                                            .matchCount = state.matchCount + 1,
+                                        });
+
+                                    continue :greedyLoop;
+                                } else {
+                                    if (state.matchCount >= range.min) {
+                                        state.pc += 1;
+                                        state.matchCount = 0;
+                                        continue :stateLoop .matching;
+                                    }
+
+                                    // Should not populate stack if < min
+                                    if (self.stack.getLastOrNull()) |last|
+                                        assert(last.pc != state.pc);
+
+                                    state.matchCount = 0;
+                                    continue :stateLoop .queryStack;
+                                }
+                            }
+
+                            if (state.matchCount == range.max) {
+                                state.pc += 1;
+                                state.matchCount = 0;
+                                continue :stateLoop .matching;
+                            }
+
+                            unreachable;
+                        },
+                        .lazy,
+                        => {
+                            lazyLoop: while (state.matchCount < range.min) : (state.matchCount += 1) {
+                                if (self.matchLiteral(text[state.cursor..], literal)) {
+                                    state.cursor += literal.len;
+                                    continue :lazyLoop;
+                                } else {
+                                    state.matchCount = 0;
+                                    continue :stateLoop .queryStack;
+                                }
+                            }
+
+                            try self.stack.append(self.allocator, state);
+                            state.pc += 1;
+                            state.matchCount = 0;
+                            continue :stateLoop .matching;
+                        },
+                    }
+                },
+            }
+        },
+        // Merge with backtracking
+        .queryStack,
+        => {
+            if (self.stack.pop()) |prevState| {
+                state = prevState;
+                continue :stateLoop .backtracking;
+            } else continue :stateLoop .failed;
+        },
+        .backtracking,
+        => {
+            switch (self.instructions[state.pc]) {
+                .literal,
+                => unreachable,
+                .group,
+                .repeatGroup,
+                => return MatchError.TBA,
+                .repeatLiteral => |repeatLiteral| {
+                    switch (repeatLiteral.quantifier.flavour) {
+                        .greedy,
+                        => {
+                            // Forwards to next token, all valid matches are stacked
+                            state.pc += 1;
+                            continue :stateLoop .matching;
+                        },
+                        .lazy,
+                        => {
+                            // Try a new match lazily based on backtracking
+                            const range = repeatLiteral.quantifier.range;
+                            const literal = repeatLiteral.literal;
+
+                            if (state.matchCount >= range.max) {
+                                state.matchCount = 0;
+                                continue :stateLoop .queryStack;
+                            }
+
+                            if (self.matchLiteral(text[state.cursor..], literal)) {
+                                state.cursor += literal.len;
+                                state.matchCount += 1;
+                                try self.stack.append(self.allocator, state);
+
+                                state.pc += 1;
+                                state.matchCount = 0;
+                                continue :stateLoop .matching;
+                            } else {
+                                state.matchCount = 0;
+                                continue :stateLoop .queryStack;
+                            }
+
+                            unreachable;
+                        },
+                    }
+                },
+            }
+        },
+        .failed,
+        => return MatchError.MatchFailed,
+        .succeeded,
+        => return,
+    }
+    unreachable;
+}
+
+fn matchLiteral(_: *const @This(), text: []const u8, literal: []const u8) bool {
+    if (literal.len > text.len)
+        return false;
+
+    if (std.mem.eql(u8, literal, text[0..literal.len]))
+        return true;
+
+    return false;
+}
+
+pub fn format(
+    self: *const @This(),
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try w.writeAll("Instructions |\n");
+
+    for (0.., self.instructions) |i, *instruction| {
+        try w.print("             | {d}] {s} {f}\n", .{ i, @tagName(instruction.*), instruction.* });
+    }
+}

@@ -312,6 +312,7 @@ pub fn collect(self: *@This()) Error![]*const RgxToken {
                     '[',
                     '^',
                     '|',
+                    '.',
                     => {
                         try self.punchLiteral();
                         continue :stateLoop .detectToken;
