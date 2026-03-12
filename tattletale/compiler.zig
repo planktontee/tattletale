@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const Scanner = @import("compiler/scanner.zig");
 const RgxToken = Scanner.RgxToken;
 const Quantifier = Scanner.Quantifier;
+const Range = @import("compiler/range.zig");
 
 pub const GroupInstruction = struct {
     n: u16,
@@ -50,30 +51,35 @@ pub const Instruction = union(enum) {
 
     repeatLiteral: *RepeatLiteral,
     repeatGroup: *RepeatGroupInstruction,
+    groupEnd: *Instruction,
 
     pub fn format(self: *const @This(), w: *std.Io.Writer) !void {
         try switch (self.*) {
             .literal => |value| w.print("'{s}'", .{value}),
+            .groupEnd => {},
             inline else => |value| w.print("{f}", .{value}),
         };
     }
 };
 
+pub const GroupResult = struct {
+    start: usize,
+    end: usize,
+};
+
 instructions: []Instruction = undefined,
 allocator: Allocator = undefined,
 stack: std.ArrayList(State) = undefined,
-
-const GroupFrame = struct {
-    n: u16,
-    instructionIdxStart: usize,
-};
+groupState: []State = undefined,
+groups: []usize = undefined,
+groupCount: usize = undefined,
 
 pub fn compile(self: *@This(), tokens: []*const RgxToken) !void {
     var instructions = try std.ArrayList(Instruction).initCapacity(self.allocator, 10);
     var groupFrames = try std.ArrayList(usize).initCapacity(self.allocator, 10);
 
     var i: usize = 0;
-    var lastInstruction: ?*Instruction = null;
+    self.groupCount = 0;
 
     while (i < tokens.len) : (i += 1) {
         switch (tokens[i].*) {
@@ -85,23 +91,22 @@ pub fn compile(self: *@This(), tokens: []*const RgxToken) !void {
                     .end = undefined,
                 };
 
+                self.groupCount += 1;
                 try instructions.append(self.allocator, .{ .group = groupInst });
                 try groupFrames.append(self.allocator, instructions.items.len - 1);
-                lastInstruction = &instructions.items[instructions.items.len - 1];
             },
             .groupEnd => {
                 const targetGroupIdx = groupFrames.pop().?;
                 const targetGroupInst: *Instruction = @ptrCast(instructions.items.ptr + targetGroupIdx);
                 const lastInst: *Instruction = @ptrCast(instructions.items.ptr + instructions.items.len - 1);
 
-                switch (lastInst.*) {
+                groupEndLoop: switch (lastInst.*) {
+                    .groupEnd => |groupInst| continue :groupEndLoop groupInst.*,
                     .literal,
                     .repeatLiteral,
                     => {
                         switch (targetGroupInst.*) {
-                            .literal,
-                            .repeatLiteral,
-                            => unreachable,
+                            .literal, .repeatLiteral, .groupEnd => unreachable,
                             inline else => |targetGroup| {
                                 targetGroup.start = targetGroupIdx + 1;
                                 targetGroup.end = instructions.items.len;
@@ -112,6 +117,7 @@ pub fn compile(self: *@This(), tokens: []*const RgxToken) !void {
                         switch (targetGroupInst.*) {
                             .literal,
                             .repeatLiteral,
+                            .groupEnd,
                             => unreachable,
                             inline else => |targetGroup| {
                                 if (lastInstGroup.n == targetGroup.n) {
@@ -126,25 +132,26 @@ pub fn compile(self: *@This(), tokens: []*const RgxToken) !void {
                     },
                 }
 
-                lastInstruction = targetGroupInst;
+                try instructions.append(self.allocator, .{ .groupEnd = targetGroupInst });
             },
             .literal => |value| {
                 try instructions.append(self.allocator, .{ .literal = value });
-                lastInstruction = &instructions.items[instructions.items.len - 1];
             },
             .quantifier => |quantifier| {
-                switch (lastInstruction.?.*) {
-                    .group => |groupIns| {
+                const lastInst: *Instruction = @ptrCast(instructions.items.ptr + instructions.items.len - 1);
+                switch (lastInst.*) {
+                    .groupEnd => |groupInstTagged| {
+                        const groupInst = groupInstTagged.group;
+
                         const repeatGroupInstruction = try self.allocator.create(RepeatGroupInstruction);
                         repeatGroupInstruction.* = .{
-                            .n = groupIns.n,
-                            .start = groupIns.start,
-                            .end = groupIns.end,
+                            .n = groupInst.n,
+                            .start = groupInst.start,
+                            .end = groupInst.end,
                             .quantifier = quantifier,
                         };
-                        lastInstruction.?.* = .{
-                            .repeatGroup = repeatGroupInstruction,
-                        };
+
+                        groupInstTagged.* = .{ .repeatGroup = repeatGroupInstruction };
                     },
                     .literal => |literalIns| {
                         const repeatLiteral = try self.allocator.create(RepeatLiteral);
@@ -152,10 +159,9 @@ pub fn compile(self: *@This(), tokens: []*const RgxToken) !void {
                             .literal = literalIns,
                             .quantifier = quantifier,
                         };
-                        lastInstruction.?.* = .{
-                            .repeatLiteral = repeatLiteral,
-                        };
+                        lastInst.* = .{ .repeatLiteral = repeatLiteral };
                     },
+                    .group,
                     .repeatGroup,
                     .repeatLiteral,
                     => unreachable,
@@ -192,11 +198,17 @@ pub const MatchError = error{
     TBA,
 } || std.mem.Allocator.Error;
 
+pub const EMPTY_MATCH: usize = std.math.maxInt(usize);
+
 pub fn match(
     self: *@This(),
     text: []const u8,
 ) MatchError!void {
     self.stack = try .initCapacity(self.allocator, 10);
+    self.groups = try self.allocator.alloc(usize, self.groupCount * 2);
+    @memset(self.groups, EMPTY_MATCH);
+
+    self.groupState = try self.allocator.alloc(State, self.groupCount);
 
     var state: State = .{
         .pc = 0,
@@ -213,10 +225,70 @@ pub fn match(
             switch (self.instructions[state.pc]) {
                 .group,
                 => |groupInst| {
-                    // TODO: save match
-                    if (groupInst.n != 0) return MatchError.TBA;
+                    self.groupState[groupInst.n] = state;
 
                     state.pc += 1;
+                    continue :stateLoop .matching;
+                },
+                .groupEnd => |groupInst| {
+                    const initialStateIdx = switch (groupInst.*) {
+                        .literal,
+                        .repeatLiteral,
+                        .groupEnd,
+                        => unreachable,
+                        inline else => |groupInstInner| groupInstInner.n,
+                    };
+
+                    var initialState: *State = @ptrCast(self.groupState.ptr + initialStateIdx);
+
+                    // TODO: refactor to method
+                    const groupInstTagged = self.instructions[initialState.pc];
+                    switch (groupInstTagged) {
+                        .literal,
+                        .groupEnd,
+                        .repeatLiteral,
+                        => unreachable,
+                        inline else => |group| {
+                            const groupIdx: usize = group.n * 2;
+                            self.groups[groupIdx] = initialState.cursor;
+                            self.groups[groupIdx + 1] = state.cursor;
+                        },
+                    }
+
+                    switch (groupInst.*) {
+                        .literal,
+                        .repeatLiteral,
+                        .groupEnd,
+                        => unreachable,
+                        .group => state.pc += 1,
+                        .repeatGroup => |repeatGroupInst| {
+                            const quantifier = repeatGroupInst.quantifier;
+                            switch (quantifier.flavour) {
+                                .lazy => return MatchError.TBA,
+                                .greedy => {
+                                    initialState.matchCount += 1;
+
+                                    const range = quantifier.range;
+
+                                    if (initialState.matchCount == range.max) {
+                                        state.pc += 1;
+                                        continue :stateLoop .matching;
+                                    }
+
+                                    if (initialState.matchCount >= range.min) {
+                                        try self.stack.append(self.allocator, .{
+                                            .cursor = state.cursor,
+                                            .pc = initialState.pc,
+                                            .matchCount = initialState.matchCount,
+                                        });
+                                    }
+
+                                    state.pc = initialState.pc + 1;
+                                },
+                            }
+                        },
+                    }
+
                     continue :stateLoop .matching;
                 },
                 .literal,
@@ -229,9 +301,20 @@ pub fn match(
                     unreachable;
                 },
                 .repeatGroup,
-                => {
-                    // Save only the last picked
-                    return MatchError.TBA;
+                => |groupInst| {
+                    state.matchCount = 0;
+                    self.groupState[groupInst.n] = state;
+
+                    if (groupInst.quantifier.range.min == 0) {
+                        try self.stack.append(self.allocator, .{
+                            .cursor = state.cursor,
+                            .pc = state.pc,
+                            .matchCount = state.matchCount,
+                        });
+                    }
+
+                    state.pc += 1;
+                    continue :stateLoop .matching;
                 },
                 .repeatLiteral,
                 => |repeatLiteral| {
@@ -312,11 +395,20 @@ pub fn match(
         .backtracking,
         => {
             switch (self.instructions[state.pc]) {
-                .literal,
-                => unreachable,
-                .group,
+                .literal, .group, .groupEnd => unreachable,
                 .repeatGroup,
-                => return MatchError.TBA,
+                => |repeatGroupInst| {
+                    switch (repeatGroupInst.quantifier.flavour) {
+                        .greedy,
+                        => {
+                            // Forwards to next token, all valid matches are stacked
+                            state.pc = repeatGroupInst.end + 1;
+                            continue :stateLoop .matching;
+                        },
+                        .lazy,
+                        => return MatchError.TBA,
+                    }
+                },
                 .repeatLiteral => |repeatLiteral| {
                     switch (repeatLiteral.quantifier.flavour) {
                         .greedy,
