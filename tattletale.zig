@@ -108,7 +108,7 @@ pub fn innerMain() Returns {
         outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
 
-        var compiler: Compiler = .{
+        var compiler: Compiler.Compiler(true) = .{
             .allocator = scrapAlloc,
             .instructions = undefined,
         };
@@ -148,14 +148,17 @@ pub fn innerMain() Returns {
         compiler.match(input) catch |e| switch (e) {
             Compiler.MatchError.MatchFailed => {
                 outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
+                compiler.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
                 return .matchFailed;
             },
             else => {
                 outW.print("\x1b[1;31mMatch execution error: {s}\n\x1b[0m", .{@errorName(e)}) catch return .stdoutWriteFailure;
+                compiler.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
                 return .matchFailed;
             },
         };
         outW.writeAll("\x1b[1;32mMatch succeeded!\n\x1b[0m") catch return .stdoutWriteFailure;
+        compiler.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
     }
 
