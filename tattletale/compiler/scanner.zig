@@ -7,6 +7,7 @@ const Range = @import("range.zig");
 const Literal = @import("literal.zig");
 const Allocator = std.mem.Allocator;
 
+// TODO: templatize diagnostics
 pub const Diagnostics = struct {
     allocator: Allocator,
     idx: *const usize,

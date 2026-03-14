@@ -5,6 +5,7 @@ pub const Quantifier = Scanner.Quantifier;
 pub const Range = @import("tattletale/compiler/range.zig");
 pub const Literal = @import("tattletale/compiler/literal.zig");
 pub const Compiler = @import("tattletale/compiler.zig");
+pub const Matcher = @import("tattletale/matcher.zig");
 
 const std = @import("std");
 
@@ -60,8 +61,8 @@ pub fn innerMain() Returns {
     var fba = std.heap.FixedBufferAllocator.init(&scrapBuff);
     const scrapAlloc = fba.allocator();
 
-    var scanner: Scanner = undefined;
-    var diag: Diagnostics = undefined;
+    const hasDiagnostics = true;
+    var compiler: Compiler.Compiler(hasDiagnostics) = .init;
 
     loop: while (true) {
         if (isTTY) {
@@ -85,36 +86,37 @@ pub fn innerMain() Returns {
         // TODO: stop trimming on non-tty, handle line break properly
         const trimmedLine = std.mem.trimEnd(u8, rawline, " \t\n");
 
-        const line = scrapAlloc.alloc(u8, trimmedLine.len) catch return .outOfMem;
-        @memcpy(line, trimmedLine);
+        const pattern = scrapAlloc.alloc(u8, trimmedLine.len) catch return .outOfMem;
+        @memcpy(pattern, trimmedLine);
         inR.toss(rawline.len);
 
-        outW.print("\x1b[1;33mRaw | {s}\n\x1b[0m", .{line}) catch return .stdoutWriteFailure;
+        outW.print("\x1b[1;33mRaw | {s}\n\x1b[0m", .{pattern}) catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
 
-        scanner.initWithDiag(scrapAlloc, &diag, line) catch return .failedInit;
-        const tokens = scanner.collectWithReport() catch {
-            errW.writeAll("\x1b[1;31m") catch return .stderrWriteFailure;
-            errW.writeAll(diag.message.?) catch return .stderrWriteFailure;
-            errW.writeAll("\n\x1b[0m") catch return .stderrWriteFailure;
-            errW.flush() catch return .stderrWriteFailure;
+        var matcher: Matcher.Matcher(hasDiagnostics) = undefined;
+        matcher.init(scrapAlloc);
+        compiler.compile(scrapAlloc, pattern, &matcher) catch |e| {
+            if (compiler.scannerDiagnostics.message) |message| {
+                errW.print("\x1b[1;31m{s}\x1b[0m\n", .{message}) catch return .stderrWriteFailure;
+                errW.flush() catch return .stderrWriteFailure;
+            } else {
+                errW.print(
+                    "\x1b[1;31mCompilation failed with: {s}\x1b[0m\n",
+                    .{@errorName(e)},
+                ) catch return .stderrWriteFailure;
+                errW.flush() catch return .stderrWriteFailure;
+            }
             continue :loop;
         };
 
         outW.writeAll("\x1b[0;35mTokens |\n") catch return .stdoutWriteFailure;
-        for (tokens, 0..) |token, i| {
+        for (compiler.tokens, 0..) |token, i| {
             outW.print("       | {d}] {f}\n", .{ i, token.* }) catch return .stdoutWriteFailure;
         }
         outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
 
-        var compiler: Compiler.Compiler(true) = .{
-            .allocator = scrapAlloc,
-            .instructions = undefined,
-        };
-        compiler.compile(tokens) catch return .failedCompilation;
-
-        outW.print("{f}", .{compiler}) catch return .stdoutWriteFailure;
+        outW.print("{f}", .{matcher}) catch return .stdoutWriteFailure;
 
         if (isTTY) {
             outW.writeAll("string> ") catch return .stdoutWriteFailure;
@@ -145,20 +147,20 @@ pub fn innerMain() Returns {
         outW.print("\x1b[1;36mInput | {s}\n\x1b[0m", .{input}) catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
 
-        compiler.match(input) catch |e| switch (e) {
-            Compiler.MatchError.MatchFailed => {
+        matcher.match(input) catch |e| switch (e) {
+            Matcher.MatchError.MatchFailed => {
                 outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
-                compiler.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+                matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
                 return .matchFailed;
             },
             else => {
                 outW.print("\x1b[1;31mMatch execution error: {s}\n\x1b[0m", .{@errorName(e)}) catch return .stdoutWriteFailure;
-                compiler.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+                matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
                 return .matchFailed;
             },
         };
         outW.writeAll("\x1b[1;32mMatch succeeded!\n\x1b[0m") catch return .stdoutWriteFailure;
-        compiler.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+        matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
     }
 
