@@ -31,7 +31,8 @@ const MatchState = enum {
 pub const MatchError = error{
     MatchFailed,
     TBA,
-} || std.mem.Allocator.Error;
+} ||
+    std.mem.Allocator.Error;
 
 pub const EMPTY_MATCH: usize = std.math.maxInt(usize);
 
@@ -39,6 +40,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
     return struct {
         instructions: []Instruction = undefined,
         allocator: Allocator = undefined,
+        stackHash: std.AutoHashMap(State, void) = undefined,
         stack: std.ArrayList(State) = undefined,
         groupState: []State = undefined,
         groups: []usize = undefined,
@@ -52,9 +54,10 @@ pub fn Matcher(comptime diagnostics: bool) type {
         pub fn match(
             self: *@This(),
             text: []const u8,
-        ) MatchError!void {
+        ) anyerror!void {
             if (diagnostics) self.runStack = try .initCapacity(self.allocator, 1);
 
+            self.stackHash = .init(self.allocator);
             self.stack = try .initCapacity(self.allocator, 10);
             self.groups = try self.allocator.alloc(usize, self.groupCount * 2);
             @memset(self.groups, EMPTY_MATCH);
@@ -142,7 +145,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                                 }
 
                                                 if (initialState.matchCount >= range.min) {
-                                                    try self.stack.append(self.allocator, .{
+                                                    try self.stackState(.{
                                                         .cursor = state.cursor,
                                                         .pc = initialState.pc,
                                                         .matchCount = initialState.matchCount,
@@ -176,7 +179,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                 self.groupState[groupInst.n] = state;
 
                                 if (groupInst.quantifier.range.min == 0) {
-                                    try self.stack.append(self.allocator, .{
+                                    try self.stackState(.{
                                         .cursor = state.cursor,
                                         .pc = state.pc,
                                         .matchCount = state.matchCount,
@@ -202,7 +205,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                                 // Only add to stack retriable states
                                                 // matchCount is one behind
                                                 if (state.matchCount + 1 >= range.min)
-                                                    try self.stack.append(self.allocator, .{
+                                                    try self.stackState(.{
                                                         .cursor = state.cursor,
                                                         .pc = state.pc,
                                                         .matchCount = state.matchCount + 1,
@@ -247,7 +250,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                             }
                                         }
 
-                                        try self.stack.append(self.allocator, state);
+                                        try self.stackState(state);
                                         state.pc += 1;
                                         state.matchCount = 0;
                                         continue :stateLoop;
@@ -311,7 +314,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                         if (self.matchLiteral(text[state.cursor..], literal)) {
                                             state.cursor += literal.len;
                                             state.matchCount += 1;
-                                            try self.stack.append(self.allocator, state);
+                                            try self.stackState(state);
 
                                             state.pc += 1;
                                             state.matchCount = 0;
@@ -346,6 +349,13 @@ pub fn Matcher(comptime diagnostics: bool) type {
                 return true;
 
             return false;
+        }
+
+        pub fn stackState(self: *@This(), state: State) !void {
+            if (!self.stackHash.contains(state)) {
+                try self.stackHash.put(state, {});
+                try self.stack.append(self.allocator, state);
+            }
         }
 
         pub fn format(

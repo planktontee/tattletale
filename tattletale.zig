@@ -61,7 +61,7 @@ pub fn innerMain() Returns {
     var fba = std.heap.FixedBufferAllocator.init(&scrapBuff);
     const scrapAlloc = fba.allocator();
 
-    const hasDiagnostics = true;
+    const hasDiagnostics = false;
     var compiler: Compiler.Compiler(hasDiagnostics) = .init;
 
     loop: while (true) {
@@ -96,8 +96,8 @@ pub fn innerMain() Returns {
         var matcher: Matcher.Matcher(hasDiagnostics) = undefined;
         matcher.init(scrapAlloc);
         compiler.compile(scrapAlloc, pattern, &matcher) catch |e| {
-            if (compiler.scannerDiagnostics.message) |message| {
-                errW.print("\x1b[1;31m{s}\x1b[0m\n", .{message}) catch return .stderrWriteFailure;
+            if (hasDiagnostics and compiler.scannerDiagnostics.message != null) {
+                errW.print("\x1b[1;31m{s}\x1b[0m\n", .{compiler.scannerDiagnostics.message.?}) catch return .stderrWriteFailure;
                 errW.flush() catch return .stderrWriteFailure;
             } else {
                 errW.print(
@@ -109,14 +109,16 @@ pub fn innerMain() Returns {
             continue :loop;
         };
 
-        outW.writeAll("\x1b[0;35mTokens |\n") catch return .stdoutWriteFailure;
-        for (compiler.tokens, 0..) |*token, i| {
-            outW.print("       | {d}] {f}\n", .{ i, token.* }) catch return .stdoutWriteFailure;
+        if (hasDiagnostics) {
+            outW.writeAll("\x1b[0;35mTokens |\n") catch return .stdoutWriteFailure;
+            for (compiler.tokens, 0..) |*token, i| {
+                outW.print("       | {d}] {f}\n", .{ i, token.* }) catch return .stdoutWriteFailure;
+            }
+            outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
+            outW.flush() catch return .stdoutWriteFailure;
         }
-        outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
-        outW.flush() catch return .stdoutWriteFailure;
 
-        outW.print("{f}", .{matcher}) catch return .stdoutWriteFailure;
+        if (hasDiagnostics) outW.print("{f}", .{matcher}) catch return .stdoutWriteFailure;
 
         if (isTTY) {
             outW.writeAll("string> ") catch return .stdoutWriteFailure;
