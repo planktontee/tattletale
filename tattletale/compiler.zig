@@ -67,7 +67,7 @@ pub const Instruction = union(enum) {
 pub fn Compiler(comptime withDiagnostics: bool) type {
     return struct {
         scannerDiagnostics: if (withDiagnostics) Scanner.Diagnostics else void = undefined,
-        tokens: []*const RgxToken = undefined,
+        tokens: []const RgxToken = undefined,
 
         pub const init: @This() = .{};
 
@@ -79,12 +79,12 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
             pattern: []const u8,
             matcher: *Matcher(withDiagnostics),
         ) Error!void {
-            var scanner: Scanner = undefined;
-            if (comptime withDiagnostics) {
-                try scanner.initWithDiag(allocator, &self.scannerDiagnostics, pattern);
-            } else {
-                try scanner.init(allocator, pattern);
-            }
+            var scanner: Scanner.Scanner(withDiagnostics) = undefined;
+            try scanner.init(
+                allocator,
+                pattern,
+                if (withDiagnostics) &self.scannerDiagnostics else {},
+            );
             self.tokens = try scanner.collectWithReport();
 
             var instructions = try std.ArrayListUnmanaged(Instruction).initCapacity(allocator, self.tokens.len);
@@ -95,7 +95,7 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
             matcher.groupCount = scanner.groupCount;
 
             while (i < self.tokens.len) : (i += 1) {
-                switch (self.tokens[i].*) {
+                switch (self.tokens[i]) {
                     .group => |n| {
                         const groupInst = try allocator.create(GroupInstruction);
                         groupInst.* = .{

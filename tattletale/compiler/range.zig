@@ -50,7 +50,11 @@ pub fn in(self: *const Range, value: usize) bool {
     return value >= self.min and value <= self.max;
 }
 
-pub fn parseRange(self: *Range, scanner: *Scanner) Error!void {
+pub fn parseRange(
+    self: *Range,
+    comptime withDiagnostics: bool,
+    scanner: *Scanner.Scanner(withDiagnostics),
+) Error!void {
     var digitsIdx: usize = undefined;
 
     stateLoop: switch (State.init) {

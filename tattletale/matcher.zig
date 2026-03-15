@@ -134,7 +134,6 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                             .lazy => return MatchError.TBA,
                                             .greedy => {
                                                 initialState.matchCount += 1;
-
                                                 const range = quantifier.range;
 
                                                 if (initialState.matchCount == range.max) {
@@ -150,6 +149,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                                     });
                                                 }
 
+                                                initialState.cursor = state.cursor;
                                                 state.pc = initialState.pc + 1;
                                                 continue :stateLoop;
                                             },
@@ -387,9 +387,11 @@ pub fn Matcher(comptime diagnostics: bool) type {
                     try w.print("Group {d}] <partial state [{d}, EMPTY]>\n", .{ i, start });
                 } else if (start == EMPTY_MATCH and end != EMPTY_MATCH) {
                     try w.print("Group {d}] <partial state [EMPTY, {d}]>\n", .{ i, end });
-                } else {
+                } else if (start < end) {
                     const piece = text[start..end];
                     try w.print("Group {d}] {s}\n", .{ i, piece });
+                } else {
+                    try w.print("Group {d}] Bad state [{d}, {d}]\n", .{ i, start, end });
                 }
             }
             try w.writeAll("\x1b[0m");

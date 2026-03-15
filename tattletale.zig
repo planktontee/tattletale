@@ -110,7 +110,7 @@ pub fn innerMain() Returns {
         };
 
         outW.writeAll("\x1b[0;35mTokens |\n") catch return .stdoutWriteFailure;
-        for (compiler.tokens, 0..) |token, i| {
+        for (compiler.tokens, 0..) |*token, i| {
             outW.print("       | {d}] {f}\n", .{ i, token.* }) catch return .stdoutWriteFailure;
         }
         outW.writeAll("\x1b[0m") catch return .stdoutWriteFailure;
@@ -149,18 +149,18 @@ pub fn innerMain() Returns {
 
         matcher.match(input) catch |e| switch (e) {
             Matcher.MatchError.MatchFailed => {
-                outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
                 matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+                outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
                 return .matchFailed;
             },
             else => {
-                outW.print("\x1b[1;31mMatch execution error: {s}\n\x1b[0m", .{@errorName(e)}) catch return .stdoutWriteFailure;
                 matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+                outW.print("\x1b[1;31mMatch execution error: {s}\n\x1b[0m", .{@errorName(e)}) catch return .stdoutWriteFailure;
                 return .matchFailed;
             },
         };
-        outW.writeAll("\x1b[1;32mMatch succeeded!\n\x1b[0m") catch return .stdoutWriteFailure;
         matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+        outW.writeAll("\x1b[1;32mMatch succeeded!\n\x1b[0m") catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
     }
 
