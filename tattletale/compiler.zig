@@ -58,7 +58,7 @@ pub const Instruction = union(enum) {
         try w.print(".{s} ", .{@tagName(self.*)});
         try switch (self.*) {
             .literal => |value| w.print("'{s}'", .{value}),
-            .groupEnd => {},
+            .groupEnd => |inst| w.print("{f}", .{inst.*}),
             inline else => |value| w.print("{f}", .{value}),
         };
     }

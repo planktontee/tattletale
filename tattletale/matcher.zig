@@ -10,7 +10,15 @@ const RepeatLiteralInstruction = Compiler.RepeatLiteralInstruction;
 const State = struct {
     pc: usize,
     cursor: usize,
+    start: usize,
     matchCount: usize,
+
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("pc {d} start {d} cursor {d} count {d}", .{ self.pc, self.start, self.cursor, self.matchCount });
+    }
 };
 
 const EnrichedState = struct {
@@ -66,6 +74,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
             var state: State = .{
                 .pc = 0,
+                .start = 0,
                 .cursor = 0,
                 .matchCount = 0,
             };
@@ -92,6 +101,8 @@ pub fn Matcher(comptime diagnostics: bool) type {
                         switch (self.instructions[state.pc]) {
                             .group,
                             => |groupInst| {
+                                // We need to reload matchCount later
+                                // We need to restore state.start over the matches as well
                                 self.groupState[groupInst.n] = state;
 
                                 state.pc += 1;
@@ -105,20 +116,33 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                     => unreachable,
                                     inline else => |groupInstInner| groupInstInner.n,
                                 };
-
                                 var initialState: *State = @ptrCast(self.groupState.ptr + initialStateIdx);
 
-                                // TODO: refactor to method
-                                const groupInstTagged = self.instructions[initialState.pc];
-                                switch (groupInstTagged) {
+                                switch (groupInst.*) {
                                     .literal,
                                     .groupEnd,
                                     .repeatLiteral,
                                     => unreachable,
                                     inline else => |group| {
                                         const groupIdx: usize = group.n * 2;
-                                        self.groups[groupIdx] = initialState.cursor;
-                                        self.groups[groupIdx + 1] = state.cursor;
+
+                                        if (initialState.start > state.cursor) {
+                                            const out = std.fs.File.stdout();
+                                            const buff = try self.allocator.alloc(u8, 1 << 20);
+                                            defer self.allocator.free(buff);
+                                            var outFsW = out.writer(buff);
+                                            const outW = &outFsW.interface;
+                                            try self.printDiagnosis(outW, text);
+                                            try outW.print("Curr: {f}\n", .{state});
+                                            try outW.print("InG: {f}\n", .{initialState.*});
+                                            try outW.flush();
+                                            assert(false);
+                                        }
+
+                                        if (initialState.start != state.cursor) {
+                                            self.groups[groupIdx] = initialState.start;
+                                            self.groups[groupIdx + 1] = state.cursor;
+                                        }
                                     },
                                 }
 
@@ -128,6 +152,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                     .groupEnd,
                                     => unreachable,
                                     .group => {
+                                        initialState.cursor = state.cursor;
                                         state.pc += 1;
                                         continue :stateLoop;
                                     },
@@ -140,19 +165,24 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                                 const range = quantifier.range;
 
                                                 if (initialState.matchCount == range.max) {
+                                                    initialState.start = state.cursor;
+                                                    initialState.cursor = state.cursor;
                                                     state.pc += 1;
                                                     continue :stateLoop;
                                                 }
 
                                                 if (initialState.matchCount >= range.min) {
                                                     try self.stackState(.{
+                                                        .start = initialState.start,
                                                         .cursor = state.cursor,
                                                         .pc = initialState.pc,
                                                         .matchCount = initialState.matchCount,
                                                     });
                                                 }
 
-                                                initialState.cursor = state.cursor;
+                                                // Move initial cursor to do the next match
+                                                initialState.start = state.cursor;
+                                                state.start = state.cursor;
                                                 state.pc = initialState.pc + 1;
                                                 continue :stateLoop;
                                             },
@@ -165,6 +195,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                             => |literal| {
                                 if (self.matchLiteral(text[state.cursor..], literal)) {
                                     state.cursor += literal.len;
+                                    state.start = state.cursor;
                                     state.pc += 1;
                                     continue :stateLoop;
                                 } else {
@@ -180,8 +211,9 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
                                 if (groupInst.quantifier.range.min == 0) {
                                     try self.stackState(.{
-                                        .cursor = state.cursor,
                                         .pc = state.pc,
+                                        .start = state.start,
+                                        .cursor = state.cursor,
                                         .matchCount = state.matchCount,
                                     });
                                 }
@@ -206,6 +238,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                                 // matchCount is one behind
                                                 if (state.matchCount + 1 >= range.min)
                                                     try self.stackState(.{
+                                                        .start = state.cursor,
                                                         .cursor = state.cursor,
                                                         .pc = state.pc,
                                                         .matchCount = state.matchCount + 1,
@@ -215,6 +248,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                             } else {
                                                 if (state.matchCount >= range.min) {
                                                     state.pc += 1;
+                                                    state.start = state.cursor;
                                                     state.matchCount = 0;
                                                     continue :stateLoop;
                                                 }
@@ -223,7 +257,6 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                                 if (self.stack.getLastOrNull()) |last|
                                                     assert(last.pc != state.pc);
 
-                                                state.matchCount = 0;
                                                 matchState = .backtracking;
                                                 continue :stateLoop;
                                             }
@@ -231,6 +264,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
                                         if (state.matchCount == range.max) {
                                             state.pc += 1;
+                                            state.start = state.cursor;
                                             state.matchCount = 0;
                                             continue :stateLoop;
                                         }
@@ -252,6 +286,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
                                         try self.stackState(state);
                                         state.pc += 1;
+                                        state.start = state.cursor;
                                         state.matchCount = 0;
                                         continue :stateLoop;
                                     },
@@ -275,12 +310,17 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                 switch (repeatGroupInst.quantifier.flavour) {
                                     .greedy,
                                     => {
+                                        const initState: *State = @ptrCast(self.groupState.ptr + repeatGroupInst.n);
+
+                                        initState.start = state.start;
+                                        initState.cursor = state.cursor;
+                                        initState.matchCount = state.matchCount;
+
                                         // Forwards to next token, all valid matches are stacked
                                         // restore last match
                                         const groupIdx = repeatGroupInst.n * 2;
-                                        if (self.groups[groupIdx] != EMPTY_MATCH) {
-                                            self.groups[groupIdx + 1] = state.cursor;
-                                        }
+                                        self.groups[groupIdx] = state.start;
+                                        self.groups[groupIdx + 1] = state.cursor;
 
                                         state.pc = repeatGroupInst.end + 1;
                                         matchState = .matching;
@@ -306,7 +346,6 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                         const literal = repeatLiteral.literal;
 
                                         if (state.matchCount >= range.max) {
-                                            state.matchCount = 0;
                                             matchState = .backtracking;
                                             continue :stateLoop;
                                         }
@@ -318,10 +357,10 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
                                             state.pc += 1;
                                             state.matchCount = 0;
+                                            state.start = state.cursor;
                                             matchState = .matching;
                                             continue :stateLoop;
                                         } else {
-                                            state.matchCount = 0;
                                             matchState = .backtracking;
                                             continue :stateLoop;
                                         }
@@ -399,12 +438,16 @@ pub fn Matcher(comptime diagnostics: bool) type {
                     try w.print("Group {d}] <partial state [EMPTY, {d}]>\n", .{ i, end });
                 } else if (start < end) {
                     const piece = text[start..end];
-                    try w.print("Group {d}] {s}\n", .{ i, piece });
+                    try w.print("Group {d}] {s} [{d}, {d}]\n", .{ i, piece, start, end });
                 } else {
                     try w.print("Group {d}] Bad state [{d}, {d}]\n", .{ i, start, end });
                 }
             }
             try w.writeAll("\x1b[0m");
+
+            for (self.stack.items, 0..) |item, i| {
+                try w.print("Backtrack {d}] {f}\n", .{ i, item });
+            }
         }
     };
 }
