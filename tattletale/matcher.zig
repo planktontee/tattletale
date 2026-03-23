@@ -20,6 +20,10 @@ const State = struct {
         try w.print("pc {d} start {d} cursor {d} count {d}", .{ self.pc, self.start, self.cursor, self.matchCount });
     }
 
+    pub fn jumpInstructionTo(self: *@This(), idx: usize) void {
+        self.pc = idx;
+    }
+
     pub fn nextInstruction(self: *@This()) void {
         self.pc += 1;
     }
@@ -36,6 +40,10 @@ const State = struct {
 
     pub fn moveCursorBy(self: *@This(), count: usize) void {
         self.cursor += count;
+    }
+
+    pub fn moveCursorTo(self: *@This(), idx: usize) void {
+        self.cursor = idx;
     }
 
     pub fn resetStart(self: *@This()) void {
@@ -94,15 +102,25 @@ pub const MatchError = error{
 
 pub const EMPTY_MATCH: usize = std.math.maxInt(usize);
 
+const RepeatableGroupState = enum {
+    @"continue",
+    finished,
+};
+
 pub fn Matcher(comptime diagnostics: bool) type {
     return struct {
-        instructions: []Instruction = undefined,
         allocator: Allocator = undefined,
-        backtrackVisitor: std.AutoHashMap(State, void) = undefined,
-        stack: std.ArrayList(State) = undefined,
-        groupState: []State = undefined,
-        groups: []usize = undefined,
+        instructions: []Instruction = undefined,
         groupCount: usize = undefined,
+        // Hashset to avoid revisinting states during backtrack
+        backtrackVisitor: std.AutoHashMap(State, void) = undefined,
+        // Backtrack stack
+        stack: std.ArrayList(State) = undefined,
+        // Shadow state for groups, treated completely iteratively
+        groupState: []State = undefined,
+        // End group match
+        groups: []usize = undefined,
+        // Diagnostics stack, optional based on template
         runStack: if (diagnostics) std.ArrayList(EnrichedState) else void = if (diagnostics) undefined else {},
 
         pub fn init(self: *@This(), allocator: Allocator) void {
@@ -241,12 +259,14 @@ pub fn Matcher(comptime diagnostics: bool) type {
             text: []const u8,
         ) !bool {
             switch (repeatLiteralInst.quantifier.flavour) {
+                // No-op since greedy fills backtrack during match
                 .greedy => return true,
+                // Fills next match during backtrack
                 .lazy => {
                     const range = repeatLiteralInst.quantifier.range;
                     const literal = repeatLiteralInst.literal;
 
-                    // Cant match anymore
+                    // Cant match anymore, so state cant be changed
                     if (state.matchCount >= range.max)
                         return false;
 
@@ -257,6 +277,99 @@ pub fn Matcher(comptime diagnostics: bool) type {
                         return true;
                     }
                     return false;
+                },
+            }
+            unreachable;
+        }
+
+        fn getGroupState(self: *const @This(), groupInst: anytype) *State {
+            return @ptrCast(self.groupState.ptr + groupInst.n);
+        }
+
+        fn getGroupStateFromInstPtr(self: *const @This(), inst: *Instruction) *State {
+            return switch (inst.*) {
+                // Cannot retrieve group state from these instructions
+                .literal,
+                .repeatLiteral,
+                .groupEnd,
+                => unreachable,
+                .repeatGroup => |groupInst| self.getGroupState(groupInst),
+                .group => |groupInst| self.getGroupState(groupInst),
+            };
+        }
+
+        fn groupIdx(_: *const @This(), groupInst: anytype) usize {
+            return groupInst.n * 2;
+        }
+
+        fn groupIdxFromInstPtr(self: *const @This(), inst: *Instruction) usize {
+            return switch (inst.*) {
+                .literal,
+                .groupEnd,
+                .repeatLiteral,
+                => unreachable,
+                .repeatGroup => |groupInst| self.groupIdx(groupInst),
+                .group => |groupInst| self.groupIdx(groupInst),
+            };
+        }
+
+        fn saveGroupMatch(
+            self: *@This(),
+            inst: *Instruction,
+            groupState: *State,
+            state: State,
+        ) void {
+            const idx: usize = self.groupIdxFromInstPtr(inst);
+
+            assert(groupState.start <= state.cursor);
+            if (groupState.start != state.cursor) {
+                self.groups[idx] = groupState.start;
+                self.groups[idx + 1] = state.cursor;
+            }
+        }
+
+        fn setGroupMatch(
+            self: *@This(),
+            groupInst: anytype,
+            state: State,
+        ) void {
+            const idx: usize = self.groupIdx(groupInst);
+
+            assert(state.start <= state.cursor);
+            self.groups[idx] = state.start;
+            self.groups[idx + 1] = state.cursor;
+        }
+
+        fn finishRepeatableGroup(
+            self: *@This(),
+            inst: *RepeatGroupInstruction,
+            groupState: *State,
+            state: *State,
+        ) !RepeatableGroupState {
+            const quantifier = inst.quantifier;
+            switch (quantifier.flavour) {
+                .lazy => return MatchError.TBA,
+                .greedy => {
+                    groupState.countMatch();
+                    const range = quantifier.range;
+
+                    if (groupState.matchCount == range.max)
+                        return .finished;
+
+                    // This ensures we can restore the group match based on this state
+                    // Range is [groupState.start, state.cursor)
+                    // This also moves the backtrack state to actual group instruction, this
+                    // is later used to identify it and then moved to groupEnd + 1
+                    if (groupState.matchCount >= range.min) {
+                        try self.stackState(.{
+                            .start = groupState.start,
+                            .cursor = state.cursor,
+                            .pc = groupState.pc,
+                            .matchCount = groupState.matchCount,
+                        });
+                    }
+
+                    return .@"continue";
                 },
             }
             unreachable;
@@ -333,87 +446,53 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                 continue :stateLoop;
                             },
                             .groupEnd => |groupInst| {
-                                const initialStateIdx = switch (groupInst.*) {
-                                    .literal,
-                                    .repeatLiteral,
-                                    .groupEnd,
-                                    => unreachable,
-                                    inline else => |groupInstInner| groupInstInner.n,
-                                };
-                                var initialState: *State = @ptrCast(self.groupState.ptr + initialStateIdx);
+                                var groupState: *State = self.getGroupStateFromInstPtr(groupInst);
+                                self.saveGroupMatch(groupInst, groupState, state);
 
                                 switch (groupInst.*) {
-                                    .literal,
-                                    .groupEnd,
-                                    .repeatLiteral,
-                                    => unreachable,
-                                    inline else => |group| {
-                                        const groupIdx: usize = group.n * 2;
-
-                                        if (initialState.start > state.cursor) {
-                                            const out = std.fs.File.stdout();
-                                            const buff = try self.allocator.alloc(u8, 1 << 20);
-                                            defer self.allocator.free(buff);
-                                            var outFsW = out.writer(buff);
-                                            const outW = &outFsW.interface;
-                                            try self.printDiagnosis(outW, text);
-                                            try outW.print("Curr: {f}\n", .{state});
-                                            try outW.print("InG: {f}\n", .{initialState.*});
-                                            try outW.flush();
-                                            assert(false);
-                                        }
-
-                                        if (initialState.start != state.cursor) {
-                                            self.groups[groupIdx] = initialState.start;
-                                            self.groups[groupIdx + 1] = state.cursor;
-                                        }
-                                    },
-                                }
-
-                                switch (groupInst.*) {
+                                    // Those are all invalid states that should never happen
+                                    // based on the compiler logic
                                     .literal,
                                     .repeatLiteral,
                                     .groupEnd,
                                     => unreachable,
                                     .group => {
-                                        initialState.cursor = state.cursor;
-                                        state.pc += 1;
-                                        continue :stateLoop;
+                                        // Reset shadow state
+                                        groupState.moveCursorTo(state.cursor);
+                                        groupState.resetStart();
+                                        // Move to next instruction with a fresh state
+                                        state.resetAndNextInstruction();
                                     },
                                     .repeatGroup => |repeatGroupInst| {
-                                        const quantifier = repeatGroupInst.quantifier;
-                                        switch (quantifier.flavour) {
-                                            .lazy => return MatchError.TBA,
-                                            .greedy => {
-                                                initialState.matchCount += 1;
-                                                const range = quantifier.range;
-
-                                                if (initialState.matchCount == range.max) {
-                                                    initialState.start = state.cursor;
-                                                    initialState.cursor = state.cursor;
-                                                    state.pc += 1;
-                                                    continue :stateLoop;
-                                                }
-
-                                                if (initialState.matchCount >= range.min) {
-                                                    try self.stackState(.{
-                                                        .start = initialState.start,
-                                                        .cursor = state.cursor,
-                                                        .pc = initialState.pc,
-                                                        .matchCount = initialState.matchCount,
-                                                    });
-                                                }
-
-                                                // Move initial cursor to do the next match
-                                                initialState.start = state.cursor;
-                                                state.start = state.cursor;
-                                                state.pc = initialState.pc + 1;
-                                                continue :stateLoop;
+                                        switch (try self.finishRepeatableGroup(
+                                            repeatGroupInst,
+                                            groupState,
+                                            &state,
+                                        )) {
+                                            .@"continue",
+                                            => {
+                                                // In this case we loop pc back to group pc start + 1
+                                                // which is essentially the first instruction after the group start
+                                                // State will start fresh to do the next group match
+                                                state.resetStart();
+                                                state.jumpInstructionTo(groupState.pc + 1);
+                                                // The shadow group state will be re-initialized to match state.cursor
+                                                // The cursor for the shadow state in this case doesn't matter
+                                                groupState.moveCursorTo(state.cursor);
+                                                groupState.resetStart();
+                                            },
+                                            .finished,
+                                            => {
+                                                // Reset shadow state
+                                                groupState.moveCursorTo(state.cursor);
+                                                groupState.resetStart();
+                                                // Move to the next instruction with a fresh state
+                                                state.resetAndNextInstruction();
                                             },
                                         }
                                     },
                                 }
-                                unreachable;
+                                continue :stateLoop;
                             },
                         }
                     },
@@ -445,24 +524,26 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                 continue :stateLoop;
                             },
                             .repeatGroup,
-                            => |repeatGroupInst| {
-                                switch (repeatGroupInst.quantifier.flavour) {
+                            => |groupInst| {
+                                switch (groupInst.quantifier.flavour) {
                                     .greedy,
                                     => {
-                                        const initState: *State = @ptrCast(self.groupState.ptr + repeatGroupInst.n);
+                                        const groupState: *State = self.getGroupState(groupInst);
 
-                                        initState.start = state.start;
-                                        initState.cursor = state.cursor;
-                                        initState.matchCount = state.matchCount;
+                                        // Shadow state start needs to be restore in case matches need to be
+                                        // redone
+                                        groupState.start = state.start;
+                                        groupState.cursor = state.cursor;
+                                        groupState.matchCount = state.matchCount;
 
-                                        // Forwards to next token, all valid matches are stacked
-                                        // restore last match
-                                        const groupIdx = repeatGroupInst.n * 2;
-                                        self.groups[groupIdx] = state.start;
-                                        self.groups[groupIdx + 1] = state.cursor;
+                                        // Restores group match based on stacked state
+                                        // States when saved by groupEnd will have the range as follow:
+                                        // [groupState.start, state.cursor]
+                                        self.setGroupMatch(groupInst, state);
 
-                                        state.pc = repeatGroupInst.end + 1;
-                                        matchState = .matching;
+                                        state.jumpInstructionTo(groupInst.end);
+                                        state.resetAndNextInstruction();
+                                        matchState.match();
                                         continue :stateLoop;
                                     },
                                     .lazy,
@@ -509,9 +590,9 @@ pub fn Matcher(comptime diagnostics: bool) type {
             }
 
             for (0..self.groupCount) |i| {
-                const groupIdx: usize = i * 2;
-                const start = self.groups[groupIdx];
-                const end = self.groups[groupIdx + 1];
+                const idx: usize = i * 2;
+                const start = self.groups[idx];
+                const end = self.groups[idx + 1];
 
                 if (start == EMPTY_MATCH and end == EMPTY_MATCH) {
                     try w.print("Group {d}] <empty match>\n", .{i});
