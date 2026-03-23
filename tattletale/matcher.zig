@@ -19,6 +19,32 @@ const State = struct {
     ) std.Io.Writer.Error!void {
         try w.print("pc {d} start {d} cursor {d} count {d}", .{ self.pc, self.start, self.cursor, self.matchCount });
     }
+
+    pub fn nextInstruction(self: *@This()) void {
+        self.pc += 1;
+    }
+
+    pub fn resetAndNextInstruction(self: *@This()) void {
+        self.nextInstruction();
+        self.restartMatchCount();
+        self.resetStart();
+    }
+
+    pub fn restartMatchCount(self: *@This()) void {
+        self.matchCount = 0;
+    }
+
+    pub fn moveCursorBy(self: *@This(), count: usize) void {
+        self.cursor += count;
+    }
+
+    pub fn resetStart(self: *@This()) void {
+        self.start = self.cursor;
+    }
+
+    pub fn countMatch(self: *@This()) void {
+        self.matchCount += 1;
+    }
 };
 
 const EnrichedState = struct {
@@ -34,6 +60,30 @@ const MatchState = enum {
     // Conclusive
     failed,
     succeeded,
+
+    pub fn match(self: *@This()) void {
+        self.* = .matching;
+    }
+
+    pub fn succeed(self: *@This()) void {
+        self.* = .succeeded;
+    }
+
+    pub fn backtrack(self: *@This()) void {
+        self.* = .backtracking;
+    }
+
+    pub fn fail(self: *@This()) void {
+        self.* = .failed;
+    }
+
+    pub fn isMatching(self: *const @This()) bool {
+        return self.* == .matching;
+    }
+
+    pub fn isNotMatching(self: *const @This()) bool {
+        return !self.isMatching();
+    }
 };
 
 pub const MatchError = error{
@@ -48,7 +98,7 @@ pub fn Matcher(comptime diagnostics: bool) type {
     return struct {
         instructions: []Instruction = undefined,
         allocator: Allocator = undefined,
-        stackHash: std.AutoHashMap(State, void) = undefined,
+        backtrackVisitor: std.AutoHashMap(State, void) = undefined,
         stack: std.ArrayList(State) = undefined,
         groupState: []State = undefined,
         groups: []usize = undefined,
@@ -59,18 +109,164 @@ pub fn Matcher(comptime diagnostics: bool) type {
             self.allocator = allocator;
         }
 
-        pub fn match(
-            self: *@This(),
-            text: []const u8,
-        ) anyerror!void {
+        fn programFinished(self: *const @This(), state: State) bool {
+            return state.pc >= self.instructions.len;
+        }
+
+        fn appendDiagnosticState(self: *@This(), matchState: MatchState, state: State) !void {
+            if (diagnostics and
+                (matchState.isMatching() and !self.programFinished(state) or matchState.isNotMatching()))
+            {
+                try self.runStack.append(self.allocator, .{
+                    .matchState = matchState,
+                    .state = state,
+                });
+            }
+        }
+
+        fn initMatch(self: *@This()) !void {
             if (diagnostics) self.runStack = try .initCapacity(self.allocator, 1);
 
-            self.stackHash = .init(self.allocator);
+            self.backtrackVisitor = .init(self.allocator);
             self.stack = try .initCapacity(self.allocator, 10);
             self.groups = try self.allocator.alloc(usize, self.groupCount * 2);
             @memset(self.groups, EMPTY_MATCH);
 
             self.groupState = try self.allocator.alloc(State, self.groupCount);
+        }
+
+        fn getInst(self: *const @This(), state: State) Instruction {
+            return self.instructions[state.pc];
+        }
+
+        fn initGroupState(self: *@This(), groupInst: anytype, state: State) void {
+            self.groupState[groupInst.n] = state;
+        }
+
+        fn stackState(self: *@This(), state: State) !void {
+            if (!self.backtrackVisitor.contains(state)) {
+                try self.backtrackVisitor.put(state, {});
+                try self.stack.append(self.allocator, state);
+            }
+        }
+
+        fn backtrackState(self: *@This(), state: *State) bool {
+            if (self.stack.pop()) |prevState| {
+                state.* = prevState;
+            } else {
+                return false;
+            }
+            return true;
+        }
+
+        fn matchLiteral(_: *const @This(), state: State, baseText: []const u8, literal: []const u8) bool {
+            const text = baseText[state.cursor..];
+
+            if (literal.len > text.len)
+                return false;
+
+            return std.mem.eql(u8, literal, text[0..literal.len]);
+        }
+
+        fn matchRepeatableLiteral(
+            self: *@This(),
+            repeatLiteralInst: *RepeatLiteralInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            state.restartMatchCount();
+            state.resetStart();
+            return switch (repeatLiteralInst.quantifier.flavour) {
+                .greedy => try self.matchGreedyLiteral(repeatLiteralInst, state, text),
+                .lazy => try self.matchLazyLiteral(repeatLiteralInst, state, text),
+            };
+        }
+
+        fn matchGreedyLiteral(
+            self: *@This(),
+            repeatLiteralInst: *RepeatLiteralInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            const range = repeatLiteralInst.quantifier.range;
+            const literal = repeatLiteralInst.literal;
+
+            while (state.matchCount < range.max) {
+                if (self.matchLiteral(state.*, text, literal)) {
+                    state.moveCursorBy(literal.len);
+                    state.countMatch();
+
+                    // Only add to stack retriable states
+                    if (state.matchCount >= range.min) try self.stackState(state.*);
+                } else {
+                    // Even on failures so long we reached the minimal, this is a success
+                    if (state.matchCount >= range.min)
+                        return true;
+
+                    // Should not populate stack if < min
+                    if (self.stack.getLastOrNull()) |last|
+                        assert(last.pc != state.pc);
+
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        fn matchLazyLiteral(
+            self: *@This(),
+            repeatLiteralInst: *RepeatLiteralInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            const range = repeatLiteralInst.quantifier.range;
+            const literal = repeatLiteralInst.literal;
+            while (state.matchCount < range.min) : (state.countMatch()) {
+                if (self.matchLiteral(state.*, text, literal)) {
+                    state.moveCursorBy(literal.len);
+                } else {
+                    return false;
+                }
+            }
+
+            try self.stackState(state.*);
+            return true;
+        }
+
+        fn backtrackRepeatableLiteral(
+            self: *@This(),
+            repeatLiteralInst: *RepeatLiteralInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            switch (repeatLiteralInst.quantifier.flavour) {
+                .greedy => return true,
+                .lazy => {
+                    const range = repeatLiteralInst.quantifier.range;
+                    const literal = repeatLiteralInst.literal;
+
+                    // Cant match anymore
+                    if (state.matchCount >= range.max)
+                        return false;
+
+                    if (self.matchLiteral(state.*, text, literal)) {
+                        state.moveCursorBy(literal.len);
+                        state.countMatch();
+                        try self.stackState(state.*);
+                        return true;
+                    }
+                    return false;
+                },
+            }
+            unreachable;
+        }
+
+        pub fn match(
+            self: *@This(),
+            text: []const u8,
+        ) anyerror!void {
+            try self.initMatch();
 
             var state: State = .{
                 .pc = 0,
@@ -81,31 +277,59 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
             var matchState: MatchState = .matching;
             stateLoop: while (true) {
-                if (diagnostics and
-                    (matchState == .matching and state.pc < self.instructions.len or matchState != .matching))
-                {
-                    try self.runStack.append(self.allocator, .{
-                        .matchState = matchState,
-                        .state = state,
-                    });
-                }
+                try self.appendDiagnosticState(matchState, state);
 
                 switch (matchState) {
                     .matching,
                     => {
-                        if (state.pc >= self.instructions.len) {
-                            matchState = .succeeded;
+                        if (self.programFinished(state)) {
+                            matchState.succeed();
                             continue :stateLoop;
                         }
 
-                        switch (self.instructions[state.pc]) {
+                        switch (self.getInst(state)) {
                             .group,
                             => |groupInst| {
-                                // We need to reload matchCount later
-                                // We need to restore state.start over the matches as well
-                                self.groupState[groupInst.n] = state;
+                                state.restartMatchCount();
+                                state.resetStart();
+                                self.initGroupState(groupInst, state);
+                                state.nextInstruction();
+                                continue :stateLoop;
+                            },
+                            .repeatGroup,
+                            => |groupInst| {
+                                state.restartMatchCount();
+                                state.resetStart();
+                                self.initGroupState(groupInst, state);
 
-                                state.pc += 1;
+                                // This is a backtrackable state if min is 0 because this group
+                                // becomes optional
+                                if (groupInst.quantifier.range.min == 0) try self.stackState(state);
+
+                                state.nextInstruction();
+                                continue :stateLoop;
+                            },
+                            .literal,
+                            => |literal| {
+                                if (self.matchLiteral(state, text, literal)) {
+                                    state.moveCursorBy(literal.len);
+                                    state.resetAndNextInstruction();
+                                } else {
+                                    matchState.backtrack();
+                                }
+                                continue :stateLoop;
+                            },
+                            .repeatLiteral,
+                            => |repeatLiteral| {
+                                if (try self.matchRepeatableLiteral(
+                                    repeatLiteral,
+                                    &state,
+                                    text,
+                                )) {
+                                    state.resetAndNextInstruction();
+                                } else {
+                                    matchState.backtrack();
+                                }
                                 continue :stateLoop;
                             },
                             .groupEnd => |groupInst| {
@@ -191,120 +415,35 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                 }
                                 unreachable;
                             },
-                            .literal,
-                            => |literal| {
-                                if (self.matchLiteral(text[state.cursor..], literal)) {
-                                    state.cursor += literal.len;
-                                    state.start = state.cursor;
-                                    state.pc += 1;
-                                    continue :stateLoop;
-                                } else {
-                                    matchState = .backtracking;
-                                    continue :stateLoop;
-                                }
-                                unreachable;
-                            },
-                            .repeatGroup,
-                            => |groupInst| {
-                                state.matchCount = 0;
-                                self.groupState[groupInst.n] = state;
-
-                                if (groupInst.quantifier.range.min == 0) {
-                                    try self.stackState(.{
-                                        .pc = state.pc,
-                                        .start = state.start,
-                                        .cursor = state.cursor,
-                                        .matchCount = state.matchCount,
-                                    });
-                                }
-
-                                state.pc += 1;
-                                continue :stateLoop;
-                            },
-                            .repeatLiteral,
-                            => |repeatLiteral| {
-                                state.matchCount = 0;
-                                const range = repeatLiteral.quantifier.range;
-                                const literal = repeatLiteral.literal;
-
-                                switch (repeatLiteral.quantifier.flavour) {
-                                    .greedy,
-                                    => {
-                                        greedyLoop: while (state.matchCount < range.max) : (state.matchCount += 1) {
-                                            if (self.matchLiteral(text[state.cursor..], literal)) {
-                                                state.cursor += literal.len;
-
-                                                // Only add to stack retriable states
-                                                // matchCount is one behind
-                                                if (state.matchCount + 1 >= range.min)
-                                                    try self.stackState(.{
-                                                        .start = state.cursor,
-                                                        .cursor = state.cursor,
-                                                        .pc = state.pc,
-                                                        .matchCount = state.matchCount + 1,
-                                                    });
-
-                                                continue :greedyLoop;
-                                            } else {
-                                                if (state.matchCount >= range.min) {
-                                                    state.pc += 1;
-                                                    state.start = state.cursor;
-                                                    state.matchCount = 0;
-                                                    continue :stateLoop;
-                                                }
-
-                                                // Should not populate stack if < min
-                                                if (self.stack.getLastOrNull()) |last|
-                                                    assert(last.pc != state.pc);
-
-                                                matchState = .backtracking;
-                                                continue :stateLoop;
-                                            }
-                                        }
-
-                                        if (state.matchCount == range.max) {
-                                            state.pc += 1;
-                                            state.start = state.cursor;
-                                            state.matchCount = 0;
-                                            continue :stateLoop;
-                                        }
-
-                                        unreachable;
-                                    },
-                                    .lazy,
-                                    => {
-                                        lazyLoop: while (state.matchCount < range.min) : (state.matchCount += 1) {
-                                            if (self.matchLiteral(text[state.cursor..], literal)) {
-                                                state.cursor += literal.len;
-                                                continue :lazyLoop;
-                                            } else {
-                                                state.matchCount = 0;
-                                                matchState = .backtracking;
-                                                continue :stateLoop;
-                                            }
-                                        }
-
-                                        try self.stackState(state);
-                                        state.pc += 1;
-                                        state.start = state.cursor;
-                                        state.matchCount = 0;
-                                        continue :stateLoop;
-                                    },
-                                }
-                            },
                         }
                     },
                     .backtracking,
                     => {
-                        if (self.stack.pop()) |prevState| {
-                            state = prevState;
-                        } else {
-                            matchState = .failed;
+                        if (!self.backtrackState(&state)) {
+                            matchState.fail();
                             continue :stateLoop;
                         }
 
-                        switch (self.instructions[state.pc]) {
+                        switch (self.getInst(state)) {
+                            // Non-backtrackable states are states that do not produce
+                            // meaningful results when executing again over a backtrack
+                            // None of these are ever mean to be stacked
                             .literal, .group, .groupEnd => unreachable,
+                            .repeatLiteral => |repeatLiteral| {
+                                // .greedy is a no-op because all possible matches were already stacked
+                                // .lazy may require further backtracking in case match fails
+                                if (try self.backtrackRepeatableLiteral(
+                                    repeatLiteral,
+                                    &state,
+                                    text,
+                                )) {
+                                    state.resetAndNextInstruction();
+                                    matchState.match();
+                                } else {
+                                    matchState.backtrack();
+                                }
+                                continue :stateLoop;
+                            },
                             .repeatGroup,
                             => |repeatGroupInst| {
                                 switch (repeatGroupInst.quantifier.flavour) {
@@ -330,45 +469,6 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                     => return MatchError.TBA,
                                 }
                             },
-                            .repeatLiteral => |repeatLiteral| {
-                                switch (repeatLiteral.quantifier.flavour) {
-                                    .greedy,
-                                    => {
-                                        // Forwards to next token, all valid matches are stacked
-                                        state.pc += 1;
-                                        matchState = .matching;
-                                        continue :stateLoop;
-                                    },
-                                    .lazy,
-                                    => {
-                                        // Try a new match lazily based on backtracking
-                                        const range = repeatLiteral.quantifier.range;
-                                        const literal = repeatLiteral.literal;
-
-                                        if (state.matchCount >= range.max) {
-                                            matchState = .backtracking;
-                                            continue :stateLoop;
-                                        }
-
-                                        if (self.matchLiteral(text[state.cursor..], literal)) {
-                                            state.cursor += literal.len;
-                                            state.matchCount += 1;
-                                            try self.stackState(state);
-
-                                            state.pc += 1;
-                                            state.matchCount = 0;
-                                            state.start = state.cursor;
-                                            matchState = .matching;
-                                            continue :stateLoop;
-                                        } else {
-                                            matchState = .backtracking;
-                                            continue :stateLoop;
-                                        }
-
-                                        unreachable;
-                                    },
-                                }
-                            },
                         }
                     },
                     .failed,
@@ -378,23 +478,6 @@ pub fn Matcher(comptime diagnostics: bool) type {
                 }
             }
             unreachable;
-        }
-
-        fn matchLiteral(_: *const @This(), text: []const u8, literal: []const u8) bool {
-            if (literal.len > text.len)
-                return false;
-
-            if (std.mem.eql(u8, literal, text[0..literal.len]))
-                return true;
-
-            return false;
-        }
-
-        pub fn stackState(self: *@This(), state: State) !void {
-            if (!self.stackHash.contains(state)) {
-                try self.stackHash.put(state, {});
-                try self.stack.append(self.allocator, state);
-            }
         }
 
         pub fn format(

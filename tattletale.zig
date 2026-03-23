@@ -51,7 +51,7 @@ pub fn innerMain() Returns {
     // const inR = &stdinR.interface;
     // defer stdin.close();
 
-    var inFixedR = std.Io.Reader.fixed("(a+?())+ac\naaaaab");
+    var inFixedR = std.Io.Reader.fixed("(a{1,3}?())+ab\naaaaab");
     const inR = &inFixedR;
     const isTTY = false;
 
