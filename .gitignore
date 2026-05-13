@@ -3,3 +3,4 @@ allgirs
 .zig-cache
 seeksub.zip
 .vscode
+zig-pkg

@@ -537,7 +537,7 @@ pub fn Scanner(withDignostics: bool) type {
         }
 
         pub fn ensureByte(self: *const @This()) ConsumeError!void {
-            if (self.finished()) return Error.UnexpectedEnd;
+            if (self.finished()) return ConsumeError.UnexpectedEnd;
         }
 
         pub fn consumeWhite(self: *@This()) ConsumeError!void {

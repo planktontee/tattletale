@@ -22,40 +22,44 @@ const Returns = enum(u8) {
     outOfMem = 9,
 };
 
+pub var io: std.Io = undefined;
+
 pub fn main() @typeInfo(Returns).@"enum".tag_type {
+    var sTh = std.Io.Threaded.init_single_threaded;
+    io = sTh.io();
     return @intFromEnum(innerMain());
 }
 
 pub fn innerMain() Returns {
     var stderrBuff: [1024]u8 = undefined;
-    const stderr = std.fs.File.stderr();
-    var stderrW = stderr.writer(&stderrBuff);
+    const stderr = std.Io.File.stderr();
+    var stderrW = stderr.writer(io, &stderrBuff);
     const errW = &stderrW.interface;
     defer {
         errW.flush() catch {};
-        stderr.close();
+        stderr.close(io);
     }
 
     var stdoutBuff: [1024]u8 = undefined;
-    const stdout = std.fs.File.stdout();
-    var stdoutW = stdout.writer(&stdoutBuff);
+    const stdout = std.Io.File.stdout();
+    var stdoutW = stdout.writer(io, &stdoutBuff);
     const outW = &stdoutW.interface;
     defer {
         outW.flush() catch {};
-        stdout.close();
+        stdout.close(io);
     }
 
     // var stdinBuff: [4096]u8 = undefined;
-    // const stdin = std.fs.File.stdin();
-    // var stdinR = stdin.readerStreaming(&stdinBuff);
+    // const stdin = std.Io.File.stdin();
+    // var stdinR = stdin.readerStreaming(io, &stdinBuff);
     // const inR = &stdinR.interface;
-    // defer stdin.close();
+    // defer stdin.close(io);
 
     var inFixedR = std.Io.Reader.fixed("(a+())+ac\naaaaab");
     const inR = &inFixedR;
     const isTTY = false;
 
-    // const stdinStat = stdin.stat() catch return .cantStatStdin;
+    // const stdinStat = stdin.stat(io) catch return .cantStatStdin;
     // const isTTY = switch (stdinStat.kind) {
     //     .character_device => true,
     //     else => false,
