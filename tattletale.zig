@@ -6,6 +6,11 @@ pub const Range = @import("tattletale/compiler/range.zig");
 pub const Literal = @import("tattletale/compiler/literal.zig");
 pub const Compiler = @import("tattletale/compiler.zig");
 pub const Matcher = @import("tattletale/matcher.zig");
+pub const zcasp = @import("zcasp");
+pub const positionals = zcasp.positionals;
+pub const HelpData = zcasp.help.HelpData;
+pub const spec = zcasp.spec;
+pub const regent = @import("regent");
 
 const std = @import("std");
 
@@ -24,25 +29,82 @@ const Returns = enum(u8) {
 
 pub var io: std.Io = undefined;
 
-pub fn main() @typeInfo(Returns).@"enum".tag_type {
+pub const Args = struct {
+    debug: bool = false,
+
+    pub const Positionals = positionals.PositionalOf(.{
+        .TupleType = struct {
+            []const u8,
+        },
+        .ReminderType = void,
+    });
+
+    pub const Help: HelpData(@This()) = .{
+        .usage = &.{"tattletale <regex>"},
+        .description = "Thin cli to run regex on stdin.",
+        .examples = &.{
+            "echo 'a' | tattletale 'a'",
+        },
+        .positionalsDescription = .{
+            .tuple = &.{
+                "regex to be match stdin against.",
+            },
+        },
+        .optionsDescription = &.{
+            .{ .field = .debug, .description = "Enables diagnosis." },
+        },
+    };
+};
+
+const ArgsResponse = spec.SpecResponseWithConfig(Args, zcasp.help.HelpConf{
+    .simpleTypes = true,
+    .headerDelimiter = "",
+}, true);
+
+pub fn main(init: std.process.Init.Minimal) @typeInfo(Returns).@"enum".tag_type {
+    var buff: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buff);
+    const scrapAlloc = fba.allocator();
+
+    var argsRes: ArgsResponse = .init(scrapAlloc);
+    defer argsRes.deinit();
+
+    if (argsRes.parseArgs(init.args)) |parseError| {
+        std.debug.print("Last opt <{?s}>, Last token <{?s}>. ", .{ parseError.lastOpt, parseError.lastToken });
+        std.debug.print("{s}\n", .{parseError.message orelse unreachable});
+        return 1;
+    }
+
     var sTh = std.Io.Threaded.init_single_threaded;
     io = sTh.io();
-    return @intFromEnum(innerMain());
+
+    return if (argsRes.options.debug)
+        @intFromEnum(innerMain(true, &argsRes))
+    else
+        @intFromEnum(innerMain(false, &argsRes));
 }
 
-pub fn innerMain() Returns {
-    var stderrBuff: [1024]u8 = undefined;
+pub fn innerMain(comptime hasDiagnostics: bool, argsRes: *const ArgsResponse) Returns {
+    var scrapBuff: [regent.units.ByteUnit.mb * 6]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scrapBuff);
+    const scrapAlloc = fba.allocator();
+
+    const stderrBuff: []u8 = scrapAlloc.alignedAlloc(u8, .fromByteUnits(4096), regent.units.ByteUnit.mb) catch return .outOfMem;
+    defer scrapAlloc.free(stderrBuff);
+
     const stderr = std.Io.File.stderr();
-    var stderrW = stderr.writer(io, &stderrBuff);
+    var stderrW = stderr.writerStreaming(io, stderrBuff);
     const errW = &stderrW.interface;
     defer {
         errW.flush() catch {};
         stderr.close(io);
     }
 
-    var stdoutBuff: [1024]u8 = undefined;
+    const stdoutBuff: []u8 = scrapAlloc.alignedAlloc(u8, .fromByteUnits(4096), regent.units.ByteUnit.mb) catch return .outOfMem;
+    defer scrapAlloc.free(stdoutBuff);
+
     const stdout = std.Io.File.stdout();
-    var stdoutW = stdout.writer(io, &stdoutBuff);
+    var stdoutW = stdout.writerStreaming(io, stdoutBuff);
     const outW = &stdoutW.interface;
     defer {
         outW.flush() catch {};
@@ -55,55 +117,24 @@ pub fn innerMain() Returns {
     const inR = &stdinR.interface;
     defer stdin.close(io);
 
-    // var inFixedR = std.Io.Reader.fixed("(a+())+ac\naaaaab");
-    // const inR = &inFixedR;
-    // const isTTY = false;
-
-    const stdinStat = stdin.stat(io) catch return .cantStatStdin;
-    const isTTY = switch (stdinStat.kind) {
-        .character_device => true,
-        else => false,
-    };
-
-    var scrapBuff: [1 << 20 << 3]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scrapBuff);
-    const scrapAlloc = fba.allocator();
-
-    const hasDiagnostics = true;
     var compiler: Compiler.Compiler(hasDiagnostics) = .init;
-
-    loop: while (true) {
-        if (isTTY) {
-            outW.writeAll("$ ") catch return .stdoutWriteFailure;
-            outW.flush() catch return .stdoutWriteFailure;
-        }
-
-        const rawline = inR.peekDelimiterInclusive('\n') catch |e| switch (e) {
-            std.Io.Reader.DelimiterError.EndOfStream => rv: {
-                if (inR.bufferedLen() > 0)
-                    break :rv inR.buffered()
-                else
-                    break :loop;
-            },
-            else => {
-                errW.print("Failed to read stdin with: {s}\n", .{@errorName(e)}) catch
-                    return .stderrWriteFailure;
-                return .stdinReadFailure;
-            },
-        };
-        // TODO: stop trimming on non-tty, handle line break properly
-        const trimmedLine = std.mem.trimEnd(u8, rawline, " \t\n");
-
-        const pattern = scrapAlloc.alloc(u8, trimmedLine.len) catch return .outOfMem;
-        @memcpy(pattern, trimmedLine);
-        inR.toss(rawline.len);
-
+    const pattern = argsRes.positionals.tuple.@"0";
+    if (hasDiagnostics) {
         outW.print("\x1b[1;33mRaw | {s}\n\x1b[0m", .{pattern}) catch return .stdoutWriteFailure;
         outW.flush() catch return .stdoutWriteFailure;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(scrapAlloc);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    loop: while (true) {
+        defer _ = arena.reset(.free_all);
 
         var matcher: Matcher.Matcher(hasDiagnostics) = undefined;
-        matcher.init(scrapAlloc);
-        compiler.compile(scrapAlloc, pattern, &matcher) catch |e| {
+
+        matcher.init(arenaAlloc);
+        compiler.compile(arenaAlloc, pattern, &matcher) catch |e| {
             if (hasDiagnostics and compiler.scannerDiagnostics.message != null) {
                 errW.print("\x1b[1;31m{s}\x1b[0m\n", .{compiler.scannerDiagnostics.message.?}) catch return .stderrWriteFailure;
                 errW.flush() catch return .stderrWriteFailure;
@@ -128,17 +159,12 @@ pub fn innerMain() Returns {
 
         if (hasDiagnostics) outW.print("{f}", .{matcher}) catch return .stdoutWriteFailure;
 
-        if (isTTY) {
-            outW.writeAll("string> ") catch return .stdoutWriteFailure;
-            outW.flush() catch return .stdoutWriteFailure;
-        }
-
-        const rawInput = inR.peekDelimiterInclusive('\n') catch |e| switch (e) {
-            std.Io.Reader.DelimiterError.EndOfStream => rv: {
-                if (inR.bufferedLen() > 0)
-                    break :rv inR.buffered()
-                else
-                    break :loop;
+        var input = inR.takeDelimiterInclusive('\n') catch |e| switch (e) {
+            std.Io.Reader.DelimiterError.EndOfStream => r: {
+                if (inR.bufferedLen() == 0) break :loop;
+                const slice = inR.buffered();
+                inR.toss(slice.len);
+                break :r slice;
             },
             else => {
                 errW.print("Failed to read stdin with: {s}\n", .{@errorName(e)}) catch
@@ -146,31 +172,55 @@ pub fn innerMain() Returns {
                 return .stdinReadFailure;
             },
         };
+        if (input.len == 0) break :loop;
 
-        // TODO: stop trimming on non-tty, handle line break properly
-        const trimmedInput = std.mem.trimEnd(u8, rawInput, " \t\n");
+        if (input[input.len - 1] == '\n')
+            input = input[0 .. input.len - 1];
 
-        const input = scrapAlloc.alloc(u8, trimmedInput.len) catch return .outOfMem;
-        @memcpy(input, trimmedInput);
-        inR.toss(rawInput.len);
+        if (hasDiagnostics) {
+            outW.print("\x1b[1;36mInput | {s}\n\x1b[0m", .{input}) catch return .stdoutWriteFailure;
+            outW.flush() catch return .stdoutWriteFailure;
+        }
 
-        outW.print("\x1b[1;36mInput | {s}\n\x1b[0m", .{input}) catch return .stdoutWriteFailure;
-        outW.flush() catch return .stdoutWriteFailure;
-
+        var matched = true;
         matcher.match(input) catch |e| switch (e) {
             Matcher.MatchError.MatchFailed => {
-                matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
-                outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
-                return .matchFailed;
+                @branchHint(.unpredictable);
+                if (hasDiagnostics) {
+                    matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
+                    outW.writeAll("\x1b[1;31mMatch failed!\n\x1b[0m") catch return .stdoutWriteFailure;
+                }
+                matched = false;
             },
             else => {
+                @branchHint(.unlikely);
                 matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
                 outW.print("\x1b[1;31mMatch execution error: {s}\n\x1b[0m", .{@errorName(e)}) catch return .stdoutWriteFailure;
-                return .matchFailed;
+                matched = false;
             },
         };
         matcher.printDiagnosis(outW, input) catch return .stdoutWriteFailure;
-        outW.writeAll("\x1b[1;32mMatch succeeded!\n\x1b[0m") catch return .stdoutWriteFailure;
+        if (!hasDiagnostics and matched) {
+            defer outW.writeAll("\x1b[0m") catch {};
+
+            var i: usize = 1;
+            var cursor: usize = 0;
+            while (i < matcher.groupCount) : (i += 1) {
+                const idx: usize = i * 2;
+                const start = matcher.groups[idx];
+                const end = matcher.groups[idx + 1];
+
+                outW.writeAll(input[cursor..start]) catch return .stdoutWriteFailure;
+                outW.print("\x1b[0;{d}m", .{i % 4 + 33}) catch return .stdoutWriteFailure;
+                outW.writeAll(input[start..end]) catch return .stdoutWriteFailure;
+                outW.writeAll("\x1b[0m") catch {};
+
+                cursor = end;
+            }
+            if (cursor < input.len)
+                outW.writeAll(input[cursor..input.len]) catch return .stdoutWriteFailure;
+            outW.writeByte('\n') catch return .stdoutWriteFailure;
+        }
         outW.flush() catch return .stdoutWriteFailure;
     }
 
