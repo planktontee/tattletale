@@ -49,21 +49,21 @@ pub fn innerMain() Returns {
         stdout.close(io);
     }
 
-    // var stdinBuff: [4096]u8 = undefined;
-    // const stdin = std.Io.File.stdin();
-    // var stdinR = stdin.readerStreaming(io, &stdinBuff);
-    // const inR = &stdinR.interface;
-    // defer stdin.close(io);
+    var stdinBuff: [4096]u8 = undefined;
+    const stdin = std.Io.File.stdin();
+    var stdinR = stdin.readerStreaming(io, &stdinBuff);
+    const inR = &stdinR.interface;
+    defer stdin.close(io);
 
-    var inFixedR = std.Io.Reader.fixed("(a+())+ac\naaaaab");
-    const inR = &inFixedR;
-    const isTTY = false;
+    // var inFixedR = std.Io.Reader.fixed("(a+())+ac\naaaaab");
+    // const inR = &inFixedR;
+    // const isTTY = false;
 
-    // const stdinStat = stdin.stat(io) catch return .cantStatStdin;
-    // const isTTY = switch (stdinStat.kind) {
-    //     .character_device => true,
-    //     else => false,
-    // };
+    const stdinStat = stdin.stat(io) catch return .cantStatStdin;
+    const isTTY = switch (stdinStat.kind) {
+        .character_device => true,
+        else => false,
+    };
 
     var scrapBuff: [1 << 20 << 3]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scrapBuff);

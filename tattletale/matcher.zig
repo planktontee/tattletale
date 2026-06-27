@@ -6,6 +6,8 @@ const Instruction = Compiler.Instruction;
 const GroupInstruction = Compiler.GroupInstruction;
 const RepeatGroupInstruction = Compiler.RepeatGroupInstruction;
 const RepeatLiteralInstruction = Compiler.RepeatLiteralInstruction;
+const ClassFunction = Compiler.ClassFunction;
+const RepeatClassInstruction = Compiler.RepeatClassInstruction;
 
 const State = struct {
     pc: usize,
@@ -200,6 +202,78 @@ pub fn Matcher(comptime diagnostics: bool) type {
             };
         }
 
+        fn matchClass(_: *const @This(), state: State, baseText: []const u8, tag: ClassFunction.Fns) bool {
+            return tag.match(baseText[state.cursor]);
+        }
+
+        fn matchRepeatClass(
+            self: *@This(),
+            repeatClassInst: *RepeatClassInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            state.restartMatchCount();
+            state.resetStart();
+            return switch (repeatClassInst.quantifier.flavour) {
+                .greedy => try self.matchGreedyClass(repeatClassInst, state, text),
+                .lazy => try self.matchLazyClass(repeatClassInst, state, text),
+            };
+        }
+
+        // TODO: fix grouping tagging
+        fn matchGreedyClass(
+            self: *@This(),
+            repeatClassInst: *RepeatClassInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            const range = repeatClassInst.quantifier.range;
+            const tag = repeatClassInst.class.tag;
+
+            while (state.matchCount < range.max and state.cursor < text.len) {
+                if (self.matchClass(state.*, text, tag)) {
+                    state.moveCursorBy(1);
+                    state.countMatch();
+
+                    // Only add to stack retriable states
+                    if (state.matchCount >= range.min) try self.stackState(state.*);
+                } else {
+                    // Even on failures so long we reached the minimal, this is a success
+                    if (state.matchCount >= range.min)
+                        return true;
+
+                    // Should not populate stack if < min
+                    if (self.stack.getLastOrNull()) |last|
+                        assert(last.pc != state.pc);
+
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // TODO: fix grouping tagging
+        fn matchLazyClass(
+            self: *@This(),
+            repeatClassInst: *RepeatClassInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            const range = repeatClassInst.quantifier.range;
+            const tag = repeatClassInst.class.tag;
+            while (state.matchCount < range.min and state.cursor < text.len) : (state.countMatch()) {
+                if (self.matchClass(state.*, text, tag)) {
+                    state.moveCursorBy(1);
+                } else {
+                    return false;
+                }
+            }
+
+            try self.stackState(state.*);
+            return true;
+        }
+
         fn matchGreedyLiteral(
             self: *@This(),
             repeatLiteralInst: *RepeatLiteralInstruction,
@@ -282,6 +356,37 @@ pub fn Matcher(comptime diagnostics: bool) type {
             unreachable;
         }
 
+        // TODO: fix grouping tagging
+        fn backtrackRepeatableClass(
+            self: *@This(),
+            repeatClassInst: *RepeatClassInstruction,
+            state: *State,
+            text: []const u8,
+        ) !bool {
+            switch (repeatClassInst.quantifier.flavour) {
+                // No-op since greedy fills backtrack during match
+                .greedy => return true,
+                // Fills next match during backtrack
+                .lazy => {
+                    const range = repeatClassInst.quantifier.range;
+                    const tag = repeatClassInst.class.tag;
+
+                    // Cant match anymore, so state cant be changed
+                    if (state.matchCount >= range.max)
+                        return false;
+
+                    if (self.matchClass(state.*, text, tag)) {
+                        state.moveCursorBy(1);
+                        state.countMatch();
+                        try self.stackState(state.*);
+                        return true;
+                    }
+                    return false;
+                },
+            }
+            unreachable;
+        }
+
         fn getGroupState(self: *const @This(), groupInst: anytype) *State {
             return @ptrCast(self.groupState.ptr + groupInst.n);
         }
@@ -289,8 +394,10 @@ pub fn Matcher(comptime diagnostics: bool) type {
         fn getGroupStateFromInstPtr(self: *const @This(), inst: *Instruction) *State {
             return switch (inst.*) {
                 // Cannot retrieve group state from these instructions
+                .class,
                 .literal,
                 .repeatLiteral,
+                .repeatClass,
                 .groupEnd,
                 => unreachable,
                 .repeatGroup => |groupInst| self.getGroupState(groupInst),
@@ -304,9 +411,11 @@ pub fn Matcher(comptime diagnostics: bool) type {
 
         fn groupIdxFromInstPtr(self: *const @This(), inst: *Instruction) usize {
             return switch (inst.*) {
+                .class,
                 .literal,
                 .groupEnd,
                 .repeatLiteral,
+                .repeatClass,
                 => unreachable,
                 .repeatGroup => |groupInst| self.groupIdx(groupInst),
                 .group => |groupInst| self.groupIdx(groupInst),
@@ -401,6 +510,29 @@ pub fn Matcher(comptime diagnostics: bool) type {
                         }
 
                         switch (self.getInst(state)) {
+                            .class,
+                            => |class| {
+                                if (self.matchClass(state, text, class.tag)) {
+                                    state.moveCursorBy(1);
+                                    state.resetAndNextInstruction();
+                                } else {
+                                    matchState.backtrack();
+                                }
+                                continue :stateLoop;
+                            },
+                            .repeatClass,
+                            => |repeatClass| {
+                                if (try self.matchRepeatClass(
+                                    repeatClass,
+                                    &state,
+                                    text,
+                                )) {
+                                    state.resetAndNextInstruction();
+                                } else {
+                                    matchState.backtrack();
+                                }
+                                continue :stateLoop;
+                            },
                             .group,
                             => |groupInst| {
                                 state.restartMatchCount();
@@ -452,14 +584,15 @@ pub fn Matcher(comptime diagnostics: bool) type {
                                 switch (groupInst.*) {
                                     // Those are all invalid states that should never happen
                                     // based on the compiler logic
+                                    .class,
                                     .literal,
                                     .repeatLiteral,
+                                    .repeatClass,
                                     .groupEnd,
                                     => unreachable,
                                     .group => {
                                         // Reset shadow state
                                         groupState.moveCursorTo(state.cursor);
-                                        groupState.resetStart();
                                         // Move to next instruction with a fresh state
                                         state.resetAndNextInstruction();
                                     },
@@ -507,7 +640,22 @@ pub fn Matcher(comptime diagnostics: bool) type {
                             // Non-backtrackable states are states that do not produce
                             // meaningful results when executing again over a backtrack
                             // None of these are ever mean to be stacked
-                            .literal, .group, .groupEnd => unreachable,
+                            .class, .literal, .group, .groupEnd => unreachable,
+                            .repeatClass => |repeatClass| {
+                                // .greedy is a no-op because all possible matches were already stacked
+                                // .lazy may require further backtracking in case match fails
+                                if (try self.backtrackRepeatableClass(
+                                    repeatClass,
+                                    &state,
+                                    text,
+                                )) {
+                                    state.resetAndNextInstruction();
+                                    matchState.match();
+                                } else {
+                                    matchState.backtrack();
+                                }
+                                continue :stateLoop;
+                            },
                             .repeatLiteral => |repeatLiteral| {
                                 // .greedy is a no-op because all possible matches were already stacked
                                 // .lazy may require further backtracking in case match fails

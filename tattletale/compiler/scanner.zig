@@ -75,7 +75,7 @@ pub const RgxToken = union(enum) {
     groupEnd,
 
     literal: []const u8,
-
+    dot,
     quantifier: *Quantifier,
 
     pub fn format(
@@ -92,6 +92,7 @@ pub const RgxToken = union(enum) {
             .group => |n| try w.print(" {d}", .{n}),
             .literal => |lit| try w.print(" '{s}'", .{lit}),
             .groupEnd,
+            .dot,
             => {},
             inline else => |t| try w.print(" {f}", .{t}),
         }
@@ -168,6 +169,8 @@ pub fn Scanner(withDignostics: bool) type {
 
             literalMatch,
 
+            dotMatch,
+
             repeatTokenMatch,
             postRepeat,
 
@@ -192,9 +195,14 @@ pub fn Scanner(withDignostics: bool) type {
                 .detectToken => {
                     if (self.finished()) continue :stateLoop .end;
                     switch (self.peek()) {
+                        '.',
+                        => {
+                            self.tagStart();
+                            self.consume();
+                            continue :stateLoop .dotMatch;
+                        },
                         '$',
                         '^',
-                        '.',
                         '[',
                         '|',
                         '\\',
@@ -272,6 +280,27 @@ pub fn Scanner(withDignostics: bool) type {
 
                         '}',
                         => return Error.SyntaxError,
+                    }
+                },
+                .dotMatch => {
+                    if (self.finished()) {
+                        try self.punchForward();
+                        continue :stateLoop .end;
+                    }
+                    switch (self.peek()) {
+                        // ranges
+                        '{',
+                        '?',
+                        '*',
+                        '+',
+                        => {
+                            try self.punchForward();
+                            continue :stateLoop .repeatTokenMatch;
+                        },
+                        else => {
+                            try self.punchForward();
+                            continue :stateLoop .detectToken;
+                        },
                     }
                 },
                 .literalMatch => {
@@ -391,6 +420,7 @@ pub fn Scanner(withDignostics: bool) type {
             try self.punchToken(.quantifier, quantifier);
 
             switch (lastTokenRef.*) {
+                .dot,
                 .groupEnd,
                 .literal,
                 => {},
@@ -403,6 +433,7 @@ pub fn Scanner(withDignostics: bool) type {
         pub fn lastIsRepeatable(self: *const @This()) bool {
             assert(self.tokenCount() > 0);
             return switch (self.lastToken().*) {
+                .dot,
                 .groupEnd,
                 .literal,
                 => true,
@@ -483,6 +514,10 @@ pub fn Scanner(withDignostics: bool) type {
             // Should this be an actual error check?
             assert(token.* == tokenTag);
             return token;
+        }
+
+        pub fn punchForward(self: *@This()) Allocator.Error!void {
+            try self.punchToken(.dot, {});
         }
 
         pub fn punchToken(self: *@This(), comptime tokenTag: TokenTag, initExpr: anytype) Allocator.Error!void {

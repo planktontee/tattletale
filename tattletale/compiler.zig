@@ -46,6 +46,49 @@ pub const RepeatLiteralInstruction = struct {
     }
 };
 
+pub const ClassFunction = struct {
+    pub const Fns = enum {
+        dot,
+
+        pub fn match(self: @This(), c: u8) bool {
+            return switch (self) {
+                .dot => ClassFunction.dot(c),
+            };
+        }
+    };
+
+    pub fn dot(c: u8) bool {
+        return switch (c) {
+            // this is a 2 SIMD pass mask if done through SIMD
+            0x00...0x09, 0x0B...0x7F => true,
+            else => false,
+        };
+    }
+};
+
+pub const ClassInstruction = struct {
+    tag: ClassFunction.Fns,
+
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("[{s}]", .{@tagName(self.tag)});
+    }
+};
+
+pub const RepeatClassInstruction = struct {
+    class: *const ClassInstruction,
+    quantifier: *const Quantifier,
+
+    pub fn format(
+        self: *const @This(),
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("'{f}' {f}", .{ self.class, self.quantifier.* });
+    }
+};
+
 pub const Instruction = union(enum) {
     literal: []const u8,
     group: *GroupInstruction,
@@ -53,6 +96,8 @@ pub const Instruction = union(enum) {
     repeatLiteral: *RepeatLiteralInstruction,
     repeatGroup: *RepeatGroupInstruction,
     groupEnd: *Instruction,
+    class: *ClassInstruction,
+    repeatClass: *RepeatClassInstruction,
 
     pub fn format(self: *const @This(), w: *std.Io.Writer) !void {
         try w.print(".{s} ", .{@tagName(self.*)});
@@ -96,6 +141,14 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
 
             while (i < self.tokens.len) : (i += 1) {
                 switch (self.tokens[i]) {
+                    .dot => {
+                        const classInst = try allocator.create(ClassInstruction);
+                        classInst.* = .{
+                            .tag = ClassFunction.Fns.dot,
+                        };
+
+                        instructions.appendAssumeCapacity(.{ .class = classInst });
+                    },
                     .group => |n| {
                         const groupInst = try allocator.create(GroupInstruction);
                         groupInst.* = .{
@@ -116,9 +169,11 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
                             .groupEnd => |groupInst| continue :groupEndLoop groupInst.*,
                             .literal,
                             .repeatLiteral,
+                            .repeatClass,
+                            .class,
                             => {
                                 switch (targetGroupInst.*) {
-                                    .literal, .repeatLiteral, .groupEnd => unreachable,
+                                    .repeatClass, .class, .literal, .repeatLiteral, .groupEnd => unreachable,
                                     inline else => |targetGroup| {
                                         targetGroup.start = targetGroupIdx + 1;
                                         targetGroup.end = instructions.items.len;
@@ -130,6 +185,8 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
                                     .literal,
                                     .repeatLiteral,
                                     .groupEnd,
+                                    .repeatClass,
+                                    .class,
                                     => unreachable,
                                     inline else => |targetGroup| {
                                         if (lastInstGroup.n == targetGroup.n) {
@@ -165,6 +222,14 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
 
                                 groupInstTagged.* = .{ .repeatGroup = repeatGroupInstruction };
                             },
+                            .class => |classInst| {
+                                const repeatClass = try allocator.create(RepeatClassInstruction);
+                                repeatClass.* = .{
+                                    .class = classInst,
+                                    .quantifier = quantifier,
+                                };
+                                lastInst.* = .{ .repeatClass = repeatClass };
+                            },
                             .literal => |literalIns| {
                                 const repeatLiteral = try allocator.create(RepeatLiteralInstruction);
                                 repeatLiteral.* = .{
@@ -174,6 +239,7 @@ pub fn Compiler(comptime withDiagnostics: bool) type {
                                 lastInst.* = .{ .repeatLiteral = repeatLiteral };
                             },
                             .group,
+                            .repeatClass,
                             .repeatGroup,
                             .repeatLiteral,
                             => unreachable,
